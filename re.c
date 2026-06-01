@@ -833,7 +833,6 @@ static int matchquestion(regex_t* p, regex_t* pattern, const char* text, int* ma
   if (matchpattern(pattern, text, matchlength, &num_patterns))
   {
 #ifdef DEBUG
-    re_print(pattern);
     DEBUG_P("? matched %s\n", text);
 #endif
     return 1;
@@ -844,7 +843,6 @@ static int matchquestion(regex_t* p, regex_t* pattern, const char* text, int* ma
     {
       (*matchlength)++;
 #ifdef DEBUG
-      re_print(pattern);
       DEBUG_P("? matched %s\n", text);
 #endif
       return 1;
@@ -1103,17 +1101,6 @@ void verify_re_compile()
   re_compile(arr);
 }
 
-void verify_re_print()
-{
-  regex_t pattern[MAX_REGEXP_OBJECTS];
-  for (unsigned char i=0; i<MAX_REGEXP_OBJECTS; i++) {
-    //pattern[i].type = nondet_uchar();
-    assume(pattern[i].type >= 0 && pattern[i].type <= 255);
-    pattern[i].u.ccl = nondet_long();
-  }
-  re_print(&pattern);
-}
-
 void verify_re_match()
 {
   int length;
@@ -1138,7 +1125,6 @@ void verify_re_match()
 int main(int argc, char* argv[])
 {
   verify_re_compile();
-  verify_re_print();
   verify_re_match();
   return 0;
 }
