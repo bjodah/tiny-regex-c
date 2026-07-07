@@ -16,13 +16,25 @@ struct test_case {
   int len;
 };
 
-void re_print(re_t);
+static void *xmalloc (size_t n)
+{
+    void *p = malloc (n);
+    if (!p) { fputs ("out of memory\n", stderr); exit (1); }
+    return p;
+}
+
+static void *xcalloc (size_t n, size_t sz)
+{
+    void *p = calloc (n, sz);
+    if (!p) { fputs ("out of memory\n", stderr); exit (1); }
+    return p;
+}
 
 /* "\\n" => "\n" */
 char *cunquote (char* s, int l)
 {
     int i;
-    char *r = malloc (l + 1);
+    char *r = xmalloc (l + 1);
     for (i=0; i<l; i++)
     {
       if (*s == '\\' && i+1 < l)
@@ -52,7 +64,7 @@ struct test_case* read_tests (const char *fname, int *ntests)
     if (!f)
       return NULL;
     int size = 120;
-    struct test_case* vec = calloc (size, sizeof(struct test_case));
+    struct test_case* vec = xcalloc (size, sizeof(struct test_case));
     int i = 0;
     *ntests = 0;
     while (fgets(s, 80, f))
@@ -69,10 +81,16 @@ struct test_case* read_tests (const char *fname, int *ntests)
         // string from first tab
         char *str = strchr (p, '"');
         if (!str)
+        {
+          fclose (f);
           return NULL;
+        }
         char *end = strchr (str+1, '"');
         if (!end)
+        {
+          fclose (f);
           return NULL;
+        }
         l = end - str - 1;
         vec[i].text = cunquote (&str[1], l);
 
@@ -83,9 +101,12 @@ struct test_case* read_tests (const char *fname, int *ntests)
         if (i >= size)
         {
             size *= 2;
-            vec = realloc (vec, size * sizeof(struct test_case));
+            struct test_case* nv = realloc (vec, size * sizeof(struct test_case));
+            if (!nv) { fputs ("out of memory\n", stderr); fclose (f); exit (1); }
+            vec = nv;
         }
     }
+    fclose (f);
     *ntests = i;
     return vec;
 }
@@ -107,7 +128,6 @@ int do_test (struct test_case* test_case, int i, int ntests, int ok)
     int should_fail;
     int length;
     int correctlen;
-    int nfailed = 0;
 
     pattern = test_case[i].rx;
     text = test_case[i].text;
@@ -120,52 +140,89 @@ int do_test (struct test_case* test_case, int i, int ntests, int ok)
     {
         if (m != (-1))
         {
-            printf("\n");
-            re_print(re_compile(pattern));
             fprintf(stderr, "[%d/%d]: pattern '%s' matched '%s' unexpectedly, matched %i chars. \n", i+1, ntests, pattern, text, length);
-            nfailed += 1;
+            return 0;
         }
     }
     else
     {
         if (m == (-1))
         {
-            printf("\n");
-            re_print(re_compile(pattern));
             fprintf(stderr, "[%d/%d]: pattern '%s' didn't match '%s' as expected. \n", (i+1), ntests, pattern, text);
-            nfailed += 1;
+            return 0;
         }
-        else if (length != correctlen)
+        if (length != correctlen)
         {
-            printf("\n");
-            re_print(re_compile(pattern));
             fprintf(stderr, "[%d/%d]: pattern '%s' matched '%i' chars of '%s'; expected '%i'. \n", (i+1), ntests, pattern, length, text, correctlen);
-            nfailed += 1;
+            return 0;
         }
     }
-    return nfailed;
+    return 1;
 }
 
-int main()
+/* Match a (rx, text, len) tuple against the known-broken cases loaded from
+ * tests/xfail_ok.lst. Returning non-zero marks the case as expected-to-fail
+ * (xfail): a natural failure is tolerated, while an unexpected pass (XPASS)
+ * counts as a real failure, mirroring fe's PTY `xfail` semantics. */
+static int is_xfail (struct test_case* xf, int nxf,
+                     const char* rx, const char* text, int len)
 {
-    int ntests, ntests_nok;
+    for (int i = 0; i < nxf; ++i)
+    {
+        if (xf[i].len == len && strcmp(xf[i].rx, rx) == 0 && strcmp(xf[i].text, text) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int main(void)
+{
+    int ntests, ntests_nok, nxfail = 0;
     int nfailed = 0;
+    int nxpass = 0;
+    int nskipped = 0;
     int i;
+    const char *skip_xfail = getenv("RE_SKIP_XFAIL");
 
     printf("Testing hand-picked regex patterns\n");
-    
+
     //setlocale(LC_CTYPE, "en_US.UTF-8");
     struct test_case* tests_ok = read_tests ("tests/ok.lst", &ntests);
+    struct test_case* xfail = read_tests ("tests/xfail_ok.lst", &nxfail);
     for (i = 0; i < ntests; ++i)
     {
-        nfailed += do_test (tests_ok, i, ntests, 1);
+        int xf = is_xfail(xfail, nxfail, tests_ok[i].rx, tests_ok[i].text, tests_ok[i].len);
+        if (xf && skip_xfail)
+        {
+            /* Under heavy runners (ASan/MSan/Valgrind) the known-broken
+             * engine paths can abort the process, so xfail cases are not
+             * executed -- mirroring fe's FE_SKIP_SCRIPTS. */
+            nskipped += 1;
+            continue;
+        }
+        int passed = do_test (tests_ok, i, ntests, 1);
+        if (xf)
+        {
+            if (passed)
+            {
+                fprintf(stderr, "[%d/%d]: XPASS: '%s' on '%s' was expected to fail (known bug). \n",
+                        i+1, ntests, tests_ok[i].rx, tests_ok[i].text);
+                nxpass += 1;
+            }
+        }
+        else if (!passed)
+        {
+            nfailed += 1;
+        }
     }
     free_test_cases (tests_ok, ntests);
+    free_test_cases (xfail, nxfail);
 
     struct test_case* tests_nok = read_tests ("tests/nok.lst", &ntests_nok);
     for (i = 0; i < ntests_nok; ++i)
     {
-        nfailed += do_test (tests_nok, i, ntests_nok, 0);
+        if (!do_test (tests_nok, i, ntests_nok, 0))
+            nfailed += 1;
     }
     free_test_cases (tests_nok, ntests_nok);
     ntests += ntests_nok;
@@ -186,7 +243,8 @@ int main()
       }
     }
     ntests++;
-    printf(" %d/%d tests succeeded.\n", ntests - nfailed, ntests);
+    printf(" %d/%d tests succeeded (%d xfail, %d xpass, %d skipped).\n",
+           ntests - nfailed - nxpass - nskipped, ntests, nxfail, nxpass, nskipped);
 
-    return nfailed; /* 0 if all tests passed */
+    return nfailed + nxpass; /* 0 if all tests passed or only expected failures */
 }

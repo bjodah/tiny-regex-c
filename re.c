@@ -75,10 +75,7 @@ typedef struct regex_t
   unsigned short type;     /* CHAR, STAR, etc.                      */
   union
   {
-    struct {
-        char  ch; /*      the character itself             */
-        char  data[];
-    };
+    char  ch;            /*      the character itself             */
     unsigned char group_size;   /*  OR the number of group patterns. */
     unsigned char group_start; /*  OR for GROUPEND, the start index of the group. */
     struct {
@@ -87,6 +84,17 @@ typedef struct regex_t
     };
   } u;
 } regex_t;
+
+/*
+ * Character-class (and inline) data is stored as a trailing string that
+ * overlays the union, beginning at the `ch` byte (offset 0 of `u`).  The
+ * storage extends past this object into the surrounding compiled-pattern
+ * byte buffer.  RE_CCL_STR(p) points at the first class char (= old
+ * &p->u.data[-1]); RE_CCL_DAT(p) matches the old `data` base (= old
+ * &p->u.data[0]).  Both are byte-identical to the pre-refactor layout.
+ */
+#define RE_CCL_STR(p) ((char *)&(p)->u)
+#define RE_CCL_DAT(p) (RE_CCL_STR(p) + 1)
 
 static unsigned getsize(regex_t* pattern)
 {
@@ -107,7 +115,7 @@ static unsigned getsize(regex_t* pattern)
         break;
     case CHAR_CLASS:
     case INV_CHAR_CLASS:
-        size += sizeof(unsigned short) + strlen(&pattern->u.data[-1]);
+        size += sizeof(unsigned short) + strlen(RE_CCL_STR(pattern));
     default:
         break;
     }
@@ -209,7 +217,11 @@ re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* size)
 
      regex_t *re_compiled = (regex_t*)(re_data);
 
-  while (pattern[i] != '\0' && ((char*)re_compiled < (char*)re_data + bytes - sizeof(re_compiled)))
+  /* Bound the scan by the pattern length rather than re-reading past the
+   * terminator: some escape handlers (e.g. '\x') land `i` on the NUL and
+   * the trailing `i += 1` then steps one byte past the allocation. */
+  const int plen = pattern ? (int)strlen(pattern) : 0;
+  while (i < plen && ((char*)re_compiled < (char*)re_data + bytes - sizeof(re_compiled)))
   {
     c = pattern[i];
 
@@ -295,16 +307,16 @@ re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* size)
             re_compiled->u.ch = c;
             //re_compiled->u.data_len = 1;
         }
-        else if (2 != sscanf (&pattern[i], "{%hd,%hd}", &n, &m))
+        else if (2 != sscanf (&pattern[i], "{%hu,%hu}", &n, &m))
         {
           int o;
-          if (!(2 == sscanf (&pattern[i], "{%hd,}%n", &n, &o) && pattern[o] == '\0') ||
+          if (!(2 == sscanf (&pattern[i], "{%hu,}%n", &n, &o) && pattern[o] == '\0') ||
               n == 0 || n > 32767)
           {
-            if (1 != sscanf (&pattern[i], "{,%hd}", &m) ||
+            if (1 != sscanf (&pattern[i], "{,%hu}", &m) ||
                 *(p-1) == ',' || m == 0 || m > 32767)
             {
-              if (1 == sscanf (&pattern[i], "{%hd}", &n) &&
+              if (1 == sscanf (&pattern[i], "{%hu}", &n) &&
                   n > 0 && n <= 32767)
               {
                 re_compiled->type = TIMES;
@@ -439,7 +451,7 @@ re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* size)
           if (pattern[i] == '\\')
           {
 
-            if (&re_compiled->u.data[charIdx] >= (char*)re_data + bytes)
+            if (RE_CCL_DAT(re_compiled) + charIdx >= (char*)re_data + bytes)
             {
               //fputs("exceeded internal buffer!\n", stderr);
               return 0;
@@ -449,18 +461,18 @@ re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* size)
             {
               return 0;
             }
-            re_compiled->u.data[charIdx++] = pattern[i++];
+            RE_CCL_DAT(re_compiled)[charIdx++] = pattern[i++];
           }
-          else if (&re_compiled->u.data[charIdx] >= (char*)re_data + bytes)
+          else if (RE_CCL_DAT(re_compiled) + charIdx >= (char*)re_data + bytes)
           {
               //fputs("exceeded internal buffer!\n", stderr);
               return 0;
           }
 
-          re_compiled->u.data[charIdx++] = pattern[i];
+          RE_CCL_DAT(re_compiled)[charIdx++] = pattern[i];
         }
 
-        if (&re_compiled->u.data[charIdx] >= (char*)re_data + bytes)
+        if (RE_CCL_DAT(re_compiled) + charIdx >= (char*)re_data + bytes)
         {
             /* Catches cases such as [00000000000000000000000000000000000000][ */
             //fputs("exceeded internal buffer!\n", stderr);
@@ -468,7 +480,7 @@ re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* size)
         }
 
         /* Null-terminate string end */
-        re_compiled->u.data[charIdx++] = '\0';
+        RE_CCL_DAT(re_compiled)[charIdx++] = '\0';
       } break;
 
       case '\0': // EOL (dead-code)
@@ -602,7 +614,7 @@ void re_string(regex_t* pattern, char* buffer, unsigned* size)
       if (pattern->type == INV_CHAR_CLASS)
         re_string_cat_fmt_(buffer, "^");
       j = -1;
-      while((c = pattern->u.data[j]))
+      while((c = RE_CCL_DAT(pattern)[j]))
       {
         if (c == ']')
         {
@@ -782,8 +794,8 @@ static int matchone(regex_t* p, char c)
   switch (p->type)
   {
     case DOT:            return  matchdot(c);
-    case CHAR_CLASS:     return  matchcharclass(c, (const char*)&p->u.data[-1]);
-    case INV_CHAR_CLASS: return !matchcharclass(c, (const char*)&p->u.data[-1]);
+    case CHAR_CLASS:     return  matchcharclass(c, (const char*)RE_CCL_STR(p));
+    case INV_CHAR_CLASS: return !matchcharclass(c, (const char*)RE_CCL_STR(p));
     case DIGIT:          return  matchdigit(c);
     case NOT_DIGIT:      return !matchdigit(c);
     case ALPHA:          return  matchalphanum(c);

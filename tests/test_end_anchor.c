@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "re.h"
 
-int main() {
+int main(void) {
  
    const char *text = "table football";
    const char *pattern = "l$";   

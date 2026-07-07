@@ -21,7 +21,11 @@ try:
     from future_builtins import map, range
 except:
     pass
-from re import match, sre_parse
+from re import match
+try:  # Python 3.12+ renamed the internal parser module
+    import re._parser as sre_parse
+except ImportError:  # pragma: no cover
+    import sre_parse
 from itertools import product, chain, tee
 from random import choice,randint
 import string

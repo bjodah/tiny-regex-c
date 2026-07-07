@@ -2060,7 +2060,7 @@ char buf[] = {
 };
 
 
-int main()
+int main(void)
 {
   const int ntests = 10;
   size_t bufsize = sizeof(buf) - 1;

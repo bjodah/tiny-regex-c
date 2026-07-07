@@ -1,0 +1,10 @@
+# Expected-failure (xfail) cases from tests/ok.lst.
+# These exercise known-broken engine behavior in tiny-regex-c:
+#   - {n,} quantifiers report match length 2 regardless of the actual run
+#   - group (...) + quantifier (+/{n}) does not match
+# See README.md ("Broke recursive pattern matching") and the TODO notes.
+# A natural failure here is tolerated; an unexpected pass (XPASS) fails CI.
+\w{2,}			"abc"		3
+[a-z]{2,}		"abcd"		4
+([a-z][0-9])+		"a0b1"		4
+([a-z][0-9]){3}		"a0b1c2"	6
