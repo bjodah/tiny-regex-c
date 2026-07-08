@@ -3,3 +3,12 @@
 .gdbinit
 /tests/*
 !/tests/*.c
+*.o
+*.gcda
+*.gcno
+*.plist
+/compile_commands.json
+/coverage/
+/fuzz/fuzz_regex
+/fuzz/corpus/
+/fuzz/artifacts/

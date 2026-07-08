@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "re.h"
 
@@ -2068,6 +2069,12 @@ int main(void)
   int dummy = 0;
   size_t bufsizes[ntests];
   char old;
+  /* This test's runtime is quadratic in input size (worst-case backtracking
+   * on '.+nonexisting.+'); under Valgrind/heavy runners the full 32KB size
+   * takes minutes. RE_TEST2_MAX_BYTES caps which sizes get exercised, e.g.
+   * mirroring fe's FE_SKIP_SCRIPTS. Unset by default: full sweep. */
+  const char *max_bytes_env = getenv ("RE_TEST2_MAX_BYTES");
+  long max_bytes = max_bytes_env ? strtol (max_bytes_env, NULL, 10) : -1;
 
   for (i = ntests-1; i >= 0; --i)
   {
@@ -2080,6 +2087,13 @@ int main(void)
 
   for (i = 0; i < ntests; ++i)
   {
+    if (max_bytes >= 0 && (long)bufsizes[i] > max_bytes)
+    {
+      printf(" matching on %lu bytes of test input: skipped (RE_TEST2_MAX_BYTES=%ld)\n",
+             bufsizes[i], max_bytes);
+      continue;
+    }
+
     old = buf[bufsizes[i]];
     buf[bufsizes[i]] = 0;
 

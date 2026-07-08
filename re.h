@@ -15,7 +15,7 @@
  *   '+'        Plus, match one or more (greedy)
  *   '?'        Question, match zero or one (non-greedy)
  *   '[abc]'    Character class, match if one of {'a', 'b', 'c'}
- *   '[^abc]'   Inverted class, match if NOT one of {'a', 'b', 'c'} -- NOTE: feature is currently broken!
+ *   '[^abc]'   Inverted class, match if NOT one of {'a', 'b', 'c'}
  *   '[a-zA-Z]' Character ranges, the character set of the ranges { a-z | A-Z }
  *   '\s'       Whitespace, \t \f \r \n \v and spaces
  *   '\S'       Non-whitespace
@@ -23,13 +23,18 @@
  *   '\W'       Non-alphanumeric
  *   '\d'       Digits, [0-9]
  *   '\D'       Non-digits
- *
+ *   '\xXX'     Hex-encoded byte
+ *   '|'        Branch Or, e.g. a|A, \w|\s
+ *   '{n}'      Match n times
+ *   '{n,}'     Match n or more times
+ *   '{,m}'     Match m or less times
+ *   '{n,m}'    Match n to m times
+ *   '(...)'    Group, including a trailing quantifier applied to the group
  *
  */
 
 #ifndef _TINY_REGEX_C
 #define _TINY_REGEX_C
-
 
 #ifndef RE_DOT_MATCHES_NEWLINE
 /* Define to 0 if you DON'T want '.' to match '\r' + '\n' */
@@ -37,14 +42,16 @@
 #endif
 
 #ifdef __cplusplus
-extern "C"{
+extern "C" {
 #endif
 
 /* Typedef'd pointer to get abstract datatype. */
 typedef struct regex_t* re_t;
 
 /* Compile regex string pattern to custom buffer, returning # of bytes used */
-re_t re_compile_to(const char* pattern, unsigned char* re_data, unsigned* bytes);
+re_t re_compile_to(const char* pattern,
+                   unsigned char* re_data,
+                   unsigned* bytes);
 
 /* Compile regex string pattern to a regex_t-array, using internal buffer */
 re_t re_compile(const char* pattern);
@@ -61,9 +68,9 @@ int re_compare(re_t pattern1, re_t pattern2);
 /* Find matches of the compiled pattern inside text. */
 int re_matchp(re_t pattern, const char* text, int* matchlength);
 
-/* Find matches of the txt pattern inside text (will compile automatically first). */
+/* Find matches of the txt pattern inside text (will compile automatically
+ * first). */
 int re_match(const char* pattern, const char* text, int* matchlength);
-
 
 #ifdef __cplusplus
 }
