@@ -70,16 +70,12 @@ int  re_match(const char* pattern, const char* text, int* matchlength);
 The following features / regex-operators are supported by this library.
 
 
-  -  `.`         Dot, matches any character
+  -  `.`         Dot, matches any byte except newline
   -  `^`         Start anchor, matches beginning of string
   -  `$`         End anchor, matches end of string
   -  `*`         Asterisk, match zero or more (greedy)
   -  `+`         Plus, match one or more (greedy)
   -  `?`         Question, match zero or one (non-greedy)
-  -  `{n}`       Exact Quantifier
-  -  `{n,}`      Match n or more times
-  -  `{,m}`      Match m or less times
-  -  `{n,m}`     Match n to m times
   -  `[abc]`     Character class, match if one of {'a', 'b', 'c'}
   -  `[^abc]`   Inverted class, match if NOT one of {'a', 'b', 'c'}
   -  `[a-zA-Z]` Character ranges, the character set of the ranges { a-z | A-Z }
@@ -90,8 +86,16 @@ The following features / regex-operators are supported by this library.
   -  `\d`       Digits, [0-9]
   -  `\D`       Non-digits
   -  `\xXX`     Hex-encoded byte
-  -  `|`        Branch Or, e.g. a|A, \w|\s
-  -  `(...)`    Group
+  -  `[[:digit:]]` POSIX bracket classes inside character classes
+  -  `\|`       Branch Or, e.g. `a\|A`, `\w\|\s`
+  -  `\{n\}`    Exact quantifier
+  -  `\{n,\}`   Match n or more times
+  -  `\{,m\}`   Match m or less times
+  -  `\{n,m\}`  Match n to m times
+  -  `\(...\)`  Group
+
+Bare `(`, `)`, `|`, `{`, and `}` are literal characters; grouping,
+alternation, and intervals use the escaped Emacs-style forms above.
 
 ### Usage
 Compile a regex from ASCII-string (char-array) to a custom pattern structure using `re_compile()`.
@@ -127,15 +131,13 @@ if (match_idx != -1)
 For more usage examples I encourage you to look at the code in the `tests`-folder.
 
 ### TODO
-- Fix length with nested groups, e.g. `((ab)|b)+` =~ abbb => 7 not 4.
+- Fix length with nested groups, e.g. `\(\(ab\)\|b\)+` =~ abbb => 7 not 4.
 - Add `example.c` that demonstrates usage.
 - Add `tests/test_perf.c` for performance and time measurements.
 - Add optional multibyte support (e.g. UTF-8). On non-wchar systems roll our own.
 - Word boundary: \b \B
 - Non-greedy, lazy quantifiers (??, +?, *?, {n,m}?)
-- Case-insensitive option or API. `re_matchi()`
-- `re_match_capture()` with groups.
-- '.' may not match '\r' nor '\n', unless a single-line option is given.
+- Backreferences in the matcher.
 
 ### FAQ
 - *Q: What differentiates this library from other C regex implementations?*
@@ -144,4 +146,3 @@ For more usage examples I encourage you to look at the code in the `tests`-folde
 
 ### License
 All material in this repository is in the public domain.
-

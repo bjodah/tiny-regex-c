@@ -84,7 +84,7 @@ int main(void)
   printf(" %d/%d tests succeeded.\n", ntests-failed-unexpected, ntests);
 
   printf("Testing compilation of nested groups:\n");
-  re_t p = re_compile("((ab)|b)+");
+  re_t p = re_compile("\\(\\(ab\\)\\|b\\)+");
 
   /* The local regex_t layout here predates the compact 6-byte struct in
    * re.c, so these group_num/group_start reads are stale and currently
@@ -93,7 +93,7 @@ int main(void)
   ntests++;
   if (p[0].u.group_num != 6)
   {
-    printf(" [%d] (xfail) wrong [0].group_num %hu for ((ab)|b)+\n", ntests, p[0].u.group_num);
+    printf(" [%d] (xfail) wrong [0].group_num %hu for \\(\\(ab\\)\\|b\\)+\n", ntests, p[0].u.group_num);
   }
   else { printf(" [%d] XPASS: [0].group_num == 6.\n", ntests); unexpected++; }
   ntests++;
