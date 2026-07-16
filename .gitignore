@@ -12,3 +12,5 @@
 /fuzz/fuzz_regex
 /fuzz/corpus/
 /fuzz/artifacts/
+.repomixignore
+repomix-output.*
