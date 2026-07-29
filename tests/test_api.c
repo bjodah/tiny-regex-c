@@ -622,6 +622,46 @@ int main(void) {
         failed += check_spans(&cases[i]);
     }
 
+    /* Test 12c: the capture register left by a repeated group whose body
+     * can match empty.  An empty repetition ends the loop only once the
+     * minimum count is behind us (see match_rep); while the minimum is
+     * still being filled, and for the one repetition just past it, an
+     * empty body still lets the group run again, so a later repetition
+     * can consume and own the register.  Emacs' spans throughout. */
+    {
+      static const struct span_case cases[] = {
+          /* the empty branch comes first, so repetition 1 matches empty
+           * and repetition 2 matches "a" -- the register is "a" */
+          {"\\(x*\\|a\\)\\{2\\}b", "ab", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(x*\\|a\\)\\{1,2\\}b", "ab", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(x*\\|a\\)\\{2,3\\}b", "ab", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(x*\\|a\\)\\{2\\}$", "a", 2, {{0, 1}, {0, 1}}, 0},
+          {"\\(\\|a\\)\\{2\\}b", "ab", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(x*\\|ab\\)\\{2\\}c", "abc", 2, {{0, 3}, {0, 2}}, 0},
+          {"\\(x*\\|a\\)\\{3\\}b", "aab", 2, {{0, 3}, {1, 2}}, 0},
+          {"\\(x*\\|a\\|b\\)\\{3\\}c", "abc", 2, {{0, 3}, {1, 2}}, 0},
+          {"\\(x*\\|a\\)\\{2\\}\\(b\\)", "ab", 3, {{0, 2}, {0, 1}, {1, 2}}, 0},
+          {"\\(\\(x*\\|a\\)\\{2\\}\\)b", "ab", 3, {{0, 2}, {0, 1}, {0, 1}}, 0},
+          /* enough slack above the minimum and the trailing empty
+           * repetition is reachable again, so it owns the register */
+          {"\\(x*\\|a\\)\\{1,5\\}$", "aaaa", 2, {{0, 4}, {3, 4}}, 0},
+          {"\\(x*\\|a\\)\\{1,6\\}$", "aaaa", 2, {{0, 4}, {4, 4}}, 0},
+          {"\\(x*\\|a\\)\\{2,4\\}b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(x*\\|a\\)\\{2,\\}b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          /* an empty-matching branch that comes second is never reached
+           * before the input runs out, so nothing changed for these */
+          {"\\(a\\|x*\\)\\{2\\}b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(x*\\|a\\)\\{0,2\\}b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(x*\\|a\\)*b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(x*\\|a\\)+b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(x*\\)\\{3\\}b", "xb", 2, {{0, 2}, {1, 1}}, 0},
+          {"\\(a*\\)\\{2\\}b", "ab", 2, {{0, 2}, {1, 1}}, 0},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
     /* Test 13: patterns that must be reported as bad rather than quietly
      * reinterpreted as literal text.  Emacs signals an error for every
      * BAD_PATTERN entry here and accepts every OK one. */

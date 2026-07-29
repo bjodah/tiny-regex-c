@@ -1526,7 +1526,19 @@ static const char* match_group_iter(regex_t* g,
 }
 
 /* One repetition of a group finished at 'text': close its capture, then
- * prefer repeating the group over leaving it. */
+ * prefer repeating the group over leaving it.
+ *
+ * A repetition that consumed nothing normally ends the loop -- repeating it
+ * could only match empty again, forever.  Emacs stops one repetition later
+ * than that, and the difference is visible in the capture register: it
+ * compiles the mandatory head of a repeat as a counted loop with no
+ * empty-match check at all, so "\(x*\|a\)\{2\}b" against "ab" spends
+ * repetition 1 on the empty branch at 0 and repetition 2 on "a", leaving
+ * group 1 as [0,1).  Only from repetition 'min' + 1 -- the first one the
+ * loop is free to skip -- does an empty body stop it, which is where a
+ * plain '*' (min 0) has been all along.  Reproducing that is what keeps
+ * "\1" after a "\{n\}" or "\{n,m\}" agreeing with Emacs; the whole-match
+ * span is the same either way.  See utils/regex_differential.py. */
 static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
   re_span* span = group_span(ctx, k->p);
   unsigned done = k->done + 1;
@@ -1535,7 +1547,7 @@ static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
   if (span)
     span->end = (int)(text - ctx->text_start);
 
-  if (grew && done < k->max) {
+  if ((grew || done <= k->min) && done < k->max) {
     re_span saved[RE_MAX_SPANS];
     const char* end;
     save_spans(saved, ctx->out);
@@ -1545,8 +1557,10 @@ static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
       return end;
     restore_spans(ctx->out, saved);
   }
-  /* A repetition that consumed nothing gets no further by repeating, so
-   * an empty body satisfies whatever is left of 'min'. */
+  /* Leaving early on an empty body is the fallback, not the first choice:
+   * it only matters once repeating is out of reach -- a 'min' past
+   * MAX_GROUP_REPEATS, say -- where an empty body has to satisfy whatever
+   * is left of 'min' or nothing can. */
   if (done >= k->min || !grew)
     return match_cont(k->next, text, ctx);
   return NULL;
