@@ -8,7 +8,7 @@
  *
  * Supports:
  * ---------
- *   '.'        Dot, matches any byte except newline
+ *   '.'        Dot, matches any character except newline
  *   '^'        Start anchor, matches beginning of string
  *   '$'        End anchor, matches end of string
  *   '*'        Asterisk, match zero or more (greedy)
@@ -23,7 +23,12 @@
  *   '\W'       Non-alphanumeric
  *   '\d'       Digits, [0-9]
  *   '\D'       Non-digits
- *   '\xXX'     Hex-encoded byte
+ *              ('\s', '\S', '\w', '\W', '\d' and '\D' are ASCII-only, so a
+ *              multi-byte character is in none of them and in all their
+ *              complements -- as one whole character)
+ *   '\xXX'     Hex-encoded byte; a non-ASCII one is a byte that stands
+ *              alone, so it matches only where the subject has no valid
+ *              sequence around it
  *   '\|'       Branch Or; the alternatives are whole concatenations and
  *              a group bounds them, e.g. ab\|cd, x\(ab\|cd\)y
  *   '\{n\}'    Match n times
@@ -39,7 +44,25 @@
  *              ascii, blank, cntrl, digit, graph, lower, nonascii, print,
  *              punct, space, upper, word, xdigit.  Any other name is a bad
  *              pattern rather than a set of the characters spelling it.
+ *              All but '[:ascii:]' and '[:nonascii:]' are ASCII-only;
+ *              those two ask whether the character is ASCII at all.
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
+ *
+ * Characters, not bytes:
+ * ----------------------
+ * The matcher steps by UTF-8 character.  '.' consumes a whole character,
+ * a multi-byte literal in the pattern is one atom ('å*' repeats 'å', not
+ * its last byte), quantifiers and intervals count characters, and a
+ * bracket expression holds characters -- '[åä]' matches either of them
+ * and not the 0xC3 lead byte they share.  A range compares codepoints, so
+ * '[à-é]' matches ç but not ê, as in Emacs.  Case folding stays ASCII.
+ *
+ * Reported spans are byte offsets into the subject, and so is
+ * re_exec()'s start_offset.
+ *
+ * A subject or pattern that is not well-formed UTF-8 is not an error:
+ * every stray byte is a character of its own, which '.' consumes singly
+ * and which no real character ever equals.
  *
  */
 

@@ -70,7 +70,7 @@ int  re_match(const char* pattern, const char* text, int* matchlength);
 The following features / regex-operators are supported by this library.
 
 
-  -  `.`         Dot, matches any byte except newline
+  -  `.`         Dot, matches any character except newline
   -  `^`         Start anchor, matches beginning of string
   -  `$`         End anchor, matches end of string
   -  `*`         Asterisk, match zero or more (greedy)
@@ -98,6 +98,28 @@ The following features / regex-operators are supported by this library.
 
 Bare `(`, `)`, `|`, `{`, and `}` are literal characters; grouping,
 alternation, and intervals use the escaped Emacs-style forms above.
+
+### Characters, not bytes
+The matcher steps by UTF-8 character. `.` consumes a whole character, a
+multi-byte literal in the pattern is a single atom (`å*` repeats `å`, not
+its last byte), quantifiers and intervals count characters, and a bracket
+expression holds characters -- `[åä]` matches either of them and not the
+`0xC3` lead byte they share. A range compares codepoints, so `[à-é]`
+matches `ç` but not `ê`, as in Emacs.
+
+Reported spans, and `re_exec()`'s `start_offset`, stay **byte** offsets
+into the subject.
+
+Case folding and the ASCII classes (`\s`, `\S`, `\w`, `\W`, `\d`, `\D`
+and every POSIX class except `[:ascii:]` and `[:nonascii:]`) remain
+ASCII-only: a multi-byte character is in none of them, and in all of
+their complements as one whole character. `[:ascii:]` and `[:nonascii:]`
+ask whether the character is ASCII at all.
+
+Input that is not well-formed UTF-8 is not an error: every stray byte is
+a character of its own, which `.` consumes singly and which no real
+character ever equals. `\xXX` above therefore still names a byte -- a
+non-ASCII one matches only where it stands alone.
 
 `\|` has the lowest precedence, as in Emacs: its alternatives are whole
 concatenations (`ab\|cd` is `ab` or `cd`, not `a` followed by `b\|cd`),
@@ -154,7 +176,6 @@ For more usage examples I encourage you to look at the code in the `tests`-folde
 ### TODO
 - Add `example.c` that demonstrates usage.
 - Add `tests/test_perf.c` for performance and time measurements.
-- Add optional multibyte support (e.g. UTF-8). On non-wchar systems roll our own.
 - Word boundary: \b \B
 - Non-greedy, lazy quantifiers (??, +?, *?, {n,m}?)
 - Backreferences in the matcher.

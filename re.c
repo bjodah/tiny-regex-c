@@ -8,7 +8,7 @@
  *
  * Supports:
  * ---------
- *   '.'        Dot, matches any byte except newline
+ *   '.'        Dot, matches any character except newline
  *   '^'        Start anchor, matches beginning of string
  *   '$'        End anchor, matches end of string
  *   '*'        Asterisk, match zero or more (greedy)
@@ -34,8 +34,6 @@
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
  *
  * TODO:
- *   - multibyte support (mbtowc, esp. UTF-8. maybe hardcode UTF-8 without libc
- * locale insanity)
  *   - \b word boundary support
  */
 
@@ -137,7 +135,12 @@ enum regex_type_e {
 typedef struct regex_t {
   unsigned short type; /* CHAR, STAR, etc.                      */
   union {
-    char ch; /*      the character itself             */
+    struct {
+      /* CHAR's codepoint, in halves: the union is two-byte aligned and
+       * stays that way, so a 21-bit codepoint does not fit one member. */
+      unsigned short cp_lo;
+      unsigned short cp_hi;
+    };
     struct {
       unsigned char group_size; /*  OR the number of group patterns. */
       unsigned char group_num;
@@ -156,16 +159,96 @@ typedef struct regex_t {
 
 /*
  * Character-class (and inline) data is stored as a trailing string that
- * overlays the union, beginning at the `ch` byte (offset 0 of `u`).  The
- * storage extends past this object into the surrounding compiled-pattern
- * byte buffer.  RE_CCL_STR(p) points at the first class char (= old
- * &p->u.data[-1]); RE_CCL_DAT(p) matches the old `data` base (= old
- * &p->u.data[0]).  Both are byte-identical to the pre-refactor layout.
+ * overlays the union, beginning at offset 0 of `u`.  The storage extends
+ * past this object into the surrounding compiled-pattern byte buffer.
+ * RE_CCL_STR(p) points at the first class char (= old &p->u.data[-1]);
+ * RE_CCL_DAT(p) matches the old `data` base (= old &p->u.data[0]).  Both
+ * are byte-identical to the pre-refactor layout.
  */
 #define RE_CCL_STR(p) ((char*)&(p)->u)
 #define RE_CCL_DAT(p) (RE_CCL_STR(p) + 1)
 
 #define RE_TYPE_ICASE (1 << 15)
+
+/* ------------------------------------------------------------------------
+ * UTF-8 glyphs
+ *
+ * The matcher steps by character, not by byte: '.' consumes a whole
+ * glyph, a multi-byte literal in the pattern is one atom, and quantifiers
+ * and intervals count glyphs -- Emacs' semantics.  Reported spans stay
+ * byte offsets into the subject.
+ *
+ * A byte sequence that is not well-formed UTF-8 is not an error; each
+ * stray byte is a glyph of its own, the rule kg's utf8_glyph_span_at()
+ * uses.  Such a glyph is given a stand-in codepoint above anything UTF-8
+ * can encode, so it never compares equal to a real character and never
+ * falls inside a range.
+ * ---------------------------------------------------------------------- */
+
+#define RE_CP_STRAY 0x200000u /* + the byte, for a byte that stands alone */
+
+typedef struct {
+  unsigned cp;  /* the codepoint, or RE_CP_STRAY + the byte */
+  unsigned len; /* bytes it occupies, 1 to 4 */
+} re_glyph;
+
+/* The glyph at 's', which must be NUL-terminated: the terminator is not a
+ * continuation byte, so an unfinished sequence at the end of the subject
+ * decodes as stray bytes rather than reading past it. */
+static re_glyph glyph_at(const char* s) {
+  unsigned char lead = (unsigned char)s[0];
+  re_glyph g = {RE_CP_STRAY + lead, 1};
+  unsigned need, cp, i;
+
+  if (lead < 0x80) {
+    g.cp = lead;
+    return g;
+  } else if (lead >= 0xC2 && lead <= 0xDF) {
+    need = 1, cp = lead & 0x1Fu;
+  } else if (lead >= 0xE0 && lead <= 0xEF) {
+    need = 2, cp = lead & 0x0Fu;
+  } else if (lead >= 0xF0 && lead <= 0xF4) {
+    need = 3, cp = lead & 0x07u;
+  } else {
+    return g;
+  }
+
+  for (i = 1; i <= need; i++) {
+    if (((unsigned char)s[i] & 0xC0) != 0x80)
+      return g;
+    cp = (cp << 6) | ((unsigned char)s[i] & 0x3Fu);
+  }
+  g.cp = cp;
+  g.len = need + 1;
+  return g;
+}
+
+/* Where the glyph ending at 'pos' begins, 'pos' being a glyph boundary at
+ * or after 'start'.  Each candidate is decoded forward again, so this
+ * agrees with glyph_at() on stray sequences too. */
+static const char* glyph_prev(const char* start, const char* pos) {
+  const char* p = pos - 1;
+  const char* limit = pos - start > 4 ? pos - 4 : start;
+
+  while (p > limit && ((unsigned char)*p & 0xC0) == 0x80)
+    p--;
+  return glyph_at(p).len == (unsigned)(pos - p) ? p : pos - 1;
+}
+
+/* A literal byte read as a glyph.  A non-ASCII one stands alone, so it is
+ * the stray byte of that value rather than the character U+00XX. */
+static unsigned byte_cp(unsigned char b) {
+  return b < 0x80 ? b : RE_CP_STRAY + b;
+}
+
+static void set_char_cp(regex_t* p, unsigned cp) {
+  p->u.cp_lo = (unsigned short)cp;
+  p->u.cp_hi = (unsigned short)(cp >> 16);
+}
+
+static unsigned char_cp(const regex_t* p) {
+  return p->u.cp_lo | ((unsigned)p->u.cp_hi << 16);
+}
 
 static unsigned getsize(const regex_t* pattern) {
   static const unsigned char payload_size[] = {
@@ -236,14 +319,13 @@ static void reset_spans(re_match_result* out) {
 }
 
 /* Private function declarations: */
-static int matchcharclass(char c, const char* str, int icase);
-static int matchone(regex_t* p, char c);
-static int matchdigit(char c);
-static int matchalpha(char c);
-static int matchwhitespace(char c);
-static int matchmetachar(char c, const char* str);
-static int matchrange(char c, const char* str, int icase);
-static int matchdot(char c);
+static int matchcharclass(const re_glyph* g, const char* str, int icase);
+static int matchone(regex_t* p, const re_glyph* g);
+static int matchdigit(int c);
+static int matchalpha(int c);
+static int matchwhitespace(int c);
+static int matchmetachar(const re_glyph* g, char m);
+static int matchdot(unsigned cp);
 static int ismetachar(char c);
 static int named_class_len(const char* str);
 static int hex(char c);
@@ -645,7 +727,7 @@ re_t re_compile_to(const char* pattern,
                 return 0;
               if (!quantifiable(re_data, j)) {
                 re_compiled->type = CHAR;
-                re_compiled->u.ch = '{';
+                set_char_cp(re_compiled, '{');
                 break;
               }
               if (!compile_interval(&pattern[i + 1], p, re_compiled))
@@ -661,56 +743,59 @@ re_t re_compile_to(const char* pattern,
               i++;
               int h = hex(pattern[i]);
               if (h == -1) {
-                re_compiled->u.ch = '\\';
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled, '\\');
 
                 re_compiled = getnext(re_compiled);
                 if (!RE_HAS_ROOM(re_compiled))
                   return 0;
-                re_compiled->u.ch = 'x';
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled, 'x');
 
                 re_compiled = getnext(re_compiled);
                 if (!RE_HAS_ROOM(re_compiled))
                   return 0;
-                re_compiled->u.ch = pattern[i];
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled, byte_cp((unsigned char)pattern[i]));
                 break;
               }
-              re_compiled->u.ch = h << 4;
+              int byte = h << 4;
               h = hex(pattern[++i]);
               if (h != -1)
-                re_compiled->u.ch += h;
+                set_char_cp(re_compiled, byte_cp((unsigned char)(byte + h)));
               else {
-                re_compiled->u.ch = '\\';
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled, '\\');
 
                 re_compiled = getnext(re_compiled);
                 if (!RE_HAS_ROOM(re_compiled))
                   return 0;
-                re_compiled->u.ch = 'x';
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled, 'x');
 
                 re_compiled = getnext(re_compiled);
                 if (!RE_HAS_ROOM(re_compiled))
                   return 0;
-                re_compiled->u.ch = pattern[i - 1];
                 re_compiled->type = CHAR;
+                set_char_cp(re_compiled,
+                            byte_cp((unsigned char)pattern[i - 1]));
 
                 if (pattern[i]) {
                   re_compiled = getnext(re_compiled);
                   if (!RE_HAS_ROOM(re_compiled))
                     return 0;
-                  re_compiled->u.ch = pattern[i];
                   re_compiled->type = CHAR;
+                  set_char_cp(re_compiled, byte_cp((unsigned char)pattern[i]));
                 }
               }
             } break;
 
             /* Escaped character, e.g. '.', '$' or '\\' */
             default: {
+              re_glyph g = glyph_at(&pattern[i]);
               re_compiled->type = CHAR;
-              re_compiled->u.ch = pattern[i];
+              set_char_cp(re_compiled, g.cp);
+              i += (int)g.len - 1;
             } break;
           }
         }
@@ -730,11 +815,13 @@ re_t re_compile_to(const char* pattern,
       case '\0':  // EOL (dead-code)
         return 0;
 
-      /* Other characters: */
+      /* Other characters: a multi-byte one is a single atom, so "å*"
+       * repeats the character rather than its last byte. */
       default: {
+        re_glyph g = glyph_at(&pattern[i]);
         re_compiled->type = CHAR;
-        // cbmc: arithmetic overflow on signed to unsigned type conversion in c
-        re_compiled->u.ch = c;
+        set_char_cp(re_compiled, g.cp);
+        i += (int)g.len - 1;
       } break;
     }
     i += 1;
@@ -827,6 +914,24 @@ int re_compare(re_t pattern1, re_t pattern2) {
       return;                                   \
   } while (0)
 
+/* Spell 'cp' back out as UTF-8 in 'buff' (5 bytes are always enough); a
+ * stray-byte codepoint becomes the single byte it stands for. */
+static void cp_to_utf8(unsigned cp, char* buff) {
+  static const unsigned char lead[] = {0, 0xC0, 0xE0, 0xF0};
+  int extra = cp < 0x80 || cp >= RE_CP_STRAY ? 0
+              : cp < 0x800                   ? 1
+              : cp < 0x10000                 ? 2
+                                             : 3;
+  int i = 0;
+
+  if (cp >= RE_CP_STRAY)
+    cp -= RE_CP_STRAY;
+  buff[i++] = (char)(lead[extra] | (cp >> (6 * extra)));
+  while (extra--)
+    buff[i++] = (char)(0x80 | ((cp >> (6 * extra)) & 0x3F));
+  buff[i] = '\0';
+}
+
 void re_string(regex_t* pattern, char* buffer, unsigned* size) {
 #if 0
   const char *const types[] = { "UNUSED", "DOT", "BEGIN", "END", "QUESTIONMARK", "STAR", "PLUS", "CHAR", "CHAR_CLASS", "INV_CHAR_CLASS", "DIGIT", "NOT_DIGIT", "ALPHA", "NOT_ALPHA", "WHITESPACE", "NOT_WHITESPACE", "BRANCH", "GROUP", "GROUPEND", "TIMES", "TIMES_N", "TIMES_M", "TIMES_NM" };
@@ -836,6 +941,7 @@ void re_string(regex_t* pattern, char* buffer, unsigned* size) {
   int j;
   unsigned char group_end;
   char c;
+  char cp_buff[5];
   char tmp_buff[128];
 
   *size = 0;
@@ -872,7 +978,8 @@ void re_string(regex_t* pattern, char* buffer, unsigned* size) {
         re_string_cat_fmt_(buffer, "]");
         break;
       case CHAR:
-        re_string_cat_fmt_(buffer, "%c", pattern->u.ch);
+        cp_to_utf8(char_cp(pattern), cp_buff);
+        re_string_cat_fmt_(buffer, "%s", cp_buff);
         break;
       case TIMES:
         re_string_cat_fmt_(buffer, "{%hu}", pattern->u.n);
@@ -924,58 +1031,74 @@ static int hex(char c) {
 }
 
 /* Private functions: */
-static int matchdigit(char c) {
-  return isdigit((unsigned char)c);
+
+/* The value every class predicate below is asked about: a glyph's ASCII
+ * character, or EOF for a glyph that has none.  "\w", "\d", "\s" and the
+ * POSIX classes stay ASCII-only, and <ctype.h> answers "no" for EOF, so
+ * that holds for multi-byte and stray glyphs without a test in each
+ * predicate.  "[:ascii:]" and "[:nonascii:]" are the two that read the
+ * sentinel itself, which is what makes them meaningful here. */
+static int ascii_cp(unsigned cp) {
+  return cp < 0x80 ? (int)cp : EOF;
 }
-static int matchalpha(char c) {
-  return isalpha((unsigned char)c);
+
+/* ASCII-only case folding, the only folding this engine does. */
+static unsigned fold_cp(unsigned cp, int icase) {
+  return icase && cp < 0x80 ? (unsigned)tolower((int)cp) : cp;
 }
-static int matchwhitespace(char c) {
-  return isspace((unsigned char)c);
+
+static int matchdigit(int c) {
+  return isdigit(c);
 }
-static int matchalphanum(char c) {
+static int matchalpha(int c) {
+  return isalpha(c);
+}
+static int matchwhitespace(int c) {
+  return isspace(c);
+}
+static int matchalphanum(int c) {
   return ((c == '_') || matchalpha(c) || matchdigit(c));
 }
-static int matchposixalnum(char c) {
-  return isalnum((unsigned char)c);
+static int matchposixalnum(int c) {
+  return isalnum(c);
 }
-static int matchcontrol(char c) {
-  return iscntrl((unsigned char)c);
+static int matchcontrol(int c) {
+  return iscntrl(c);
 }
-static int matchgraph(char c) {
-  return isgraph((unsigned char)c);
+static int matchgraph(int c) {
+  return isgraph(c);
 }
-static int matchprint(char c) {
-  return isprint((unsigned char)c);
+static int matchprint(int c) {
+  return isprint(c);
 }
-static int matchpunct(char c) {
-  return ispunct((unsigned char)c);
+static int matchpunct(int c) {
+  return ispunct(c);
 }
-static int matchxdigit(char c) {
-  return isxdigit((unsigned char)c);
+static int matchxdigit(int c) {
+  return isxdigit(c);
 }
-static int matchblank(char c) {
+static int matchblank(int c) {
   return c == ' ' || c == '\t';
 }
 /* Emacs' "[:word:]" is the buffer's word syntax; for ASCII text that is
  * the alphanumerics, and unlike "\w" it excludes '_'. */
-static int matchword(char c) {
-  return isalnum((unsigned char)c);
+static int matchword(int c) {
+  return isalnum(c);
 }
-static int matchascii(char c) {
-  return (unsigned char)c < 0x80;
+static int matchascii(int c) {
+  return c != EOF;
 }
-static int matchnonascii(char c) {
-  return (unsigned char)c >= 0x80;
+static int matchnonascii(int c) {
+  return c == EOF;
 }
-static int matchlower(char c) {
-  return islower((unsigned char)c);
+static int matchlower(int c) {
+  return islower(c);
 }
-static int matchupper(char c) {
-  return isupper((unsigned char)c);
+static int matchupper(int c) {
+  return isupper(c);
 }
 
-typedef int (*char_matcher)(char);
+typedef int (*char_matcher)(int);
 
 static const char_matcher metachar_matchers[256] = {
     ['d'] = matchdigit,    ['D'] = matchdigit,      ['w'] = matchalphanum,
@@ -990,8 +1113,8 @@ struct named_class {
 
 /* The POSIX class names this engine honours.  Emacs also accepts
  * "[:multibyte:]" and "[:unibyte:]", whose meaning is a property of the
- * string's representation rather than of the byte; a byte-oriented matcher
- * cannot answer them, so compile_charclass() rejects those (and every
+ * string's representation rather than of the character in it; nothing
+ * here can answer them, so compile_charclass() rejects those (and every
  * unknown name) instead of quietly reading it as a set of characters. */
 static const struct named_class named_classes[] = {
     {"[:digit:]", 9, {matchdigit, matchdigit}},
@@ -1022,104 +1145,95 @@ static int named_class_len(const char* str) {
   return 0;
 }
 
-static int matchnamedclass(char c, const char** str, int icase) {
+/* The named class starting at *str, if any: +1 when 'c' is in it, -1 when
+ * it is not, 0 when *str does not spell one this engine knows.  A hit
+ * advances *str past the whole "[:name:]". */
+static int matchnamedclass(int c, const char** str, int icase) {
   for (unsigned i = 0; i < sizeof(named_classes) / sizeof(named_classes[0]);
        i++) {
     if (strncmp(*str, named_classes[i].name, named_classes[i].length) != 0)
       continue;
-    *str += named_classes[i].length - 1;
+    *str += named_classes[i].length;
     return named_classes[i].match[!!icase](c) * 2 - 1;
   }
   return 0;
 }
 
-static int matchrange(char c, const char* str, int icase) {
-  char normalized[3] = {str[0], str[1], str[2]};
-  if (icase) {
-    c = (char)tolower((unsigned char)c);
-    normalized[0] = (char)tolower((unsigned char)str[0]);
-    normalized[2] = (char)tolower((unsigned char)str[2]);
-  }
-  str = normalized;
-  return ((c != '-') && (str[0] != '\0') && (str[0] != '-') &&
-          (str[1] == '-') && (str[2] != '\0') &&
-          ((c >= str[0]) && (c <= str[2])));
-}
-static int matchdot(char c) {
+static int matchdot(unsigned cp) {
 #if defined(RE_DOT_MATCHES_NEWLINE) && (RE_DOT_MATCHES_NEWLINE == 1)
-  (void)c;
+  (void)cp;
   return 1;
 #else
-  return memchr("\n\r", c, 2) == NULL;
+  return cp != '\n' && cp != '\r';
 #endif
 }
 static int ismetachar(char c) {
   return metachar_matchers[(unsigned char)c] != NULL;
 }
 
-static int matchmetachar(char c, const char* str) {
-  char_matcher matcher = metachar_matchers[(unsigned char)str[0]];
-  if (!matcher)
-    return c == str[0];
-  return !!matcher(c) == !!islower((unsigned char)str[0]);
+/* "\d" and friends inside a bracket expression.  'm' is the letter after
+ * the backslash, and must be one ismetachar() accepts; the upper-case
+ * spelling of each is its complement. */
+static int matchmetachar(const re_glyph* g, char m) {
+  char_matcher matcher = metachar_matchers[(unsigned char)m];
+
+  return !!matcher(ascii_cp(g->cp)) == !!islower((unsigned char)m);
 }
 
-static int matchcharclass(char c, const char* str, int icase) {
-  do {
-    if (matchrange(c, str, icase)) {
-      DEBUG_P("%c matches %s\n", c, str);
-      return 1;
-    } else if (str[0] == '\\') {
-      /* Escape-char: increment str-ptr and match on next char */
-      str += 1;
-      if (matchmetachar(c, str)) {
-        return 1;
-      }
-      if (icase) {
-        if (tolower((unsigned char)c) == tolower((unsigned char)str[0]) &&
-            !ismetachar(str[0])) {
-          return 1;
-        }
-      } else {
-        if ((c == str[0]) && !ismetachar(str[0])) {
-          return 1;
-        }
-      }
-    } else {
-      int named = matchnamedclass(c, &str, icase);
+/* Match 'g' against the body of a bracket expression -- the text between
+ * '[' and ']', as compile_charclass() stored it.  Members are whole
+ * glyphs, so "[åä]" holds two of them rather than three shared bytes, and
+ * a range's endpoints are glyphs compared by codepoint, which is what
+ * Emacs does: "[à-é]" matches ç but not ê. */
+static int matchcharclass(const re_glyph* g, const char* str, int icase) {
+  unsigned c = fold_cp(g->cp, icase);
+
+  while (*str != '\0') {
+    re_glyph lo;
+
+    if (str[0] == '[') {
+      int named = matchnamedclass(ascii_cp(g->cp), &str, icase);
       if (named > 0)
         return 1;
       if (named < 0)
         continue;
-
-      if (!(icase
-                ? (tolower((unsigned char)c) == tolower((unsigned char)str[0]))
-                : (c == str[0])))
-        continue;
-      if (str[0] == '-') {
-        if ((str[-1] == '\0') || (str[1] == '\0'))
-          return 1;
-        // else continue
-      } else {
+    } else if (str[0] == '\\' && ismetachar(str[1])) {
+      if (matchmetachar(g, str[1]))
         return 1;
-      }
+      str += 2;
+      continue;
+    } else if (str[0] == '\\' && str[1] != '\0') {
+      /* An escaped ordinary character stands for itself. */
+      str++;
     }
-  } while (*str++ != '\0');
 
-  DEBUG_P("%c did not match prev. ccl\n", c);
+    lo = glyph_at(str);
+    str += lo.len;
+    if (str[0] == '-' && str[1] != '\0') {
+      re_glyph hi = glyph_at(str + 1);
+      str += 1 + hi.len;
+      if (c >= fold_cp(lo.cp, icase) && c <= fold_cp(hi.cp, icase))
+        return 1;
+    } else if (c == fold_cp(lo.cp, icase)) {
+      return 1;
+    }
+  }
+
+  DEBUG_P("%u did not match prev. ccl\n", g->cp);
   return 0;
 }
 
-static int matchone(regex_t* p, char c) {
-  DEBUG_P("ONE %d matches %c?\n", p->type, c);
+static int matchone(regex_t* p, const re_glyph* g) {
+  DEBUG_P("ONE %d matches %u?\n", p->type, g->cp);
   int icase = (p->type & RE_TYPE_ICASE) != 0;
+  int c = ascii_cp(g->cp);
   switch (p->type & ~RE_TYPE_ICASE) {
     case DOT:
-      return matchdot(c);
+      return matchdot(g->cp);
     case CHAR_CLASS:
-      return matchcharclass(c, (const char*)RE_CCL_STR(p), icase);
+      return matchcharclass(g, RE_CCL_STR(p), icase);
     case INV_CHAR_CLASS:
-      return !matchcharclass(c, (const char*)RE_CCL_STR(p), icase);
+      return !matchcharclass(g, RE_CCL_STR(p), icase);
     case DIGIT:
       return matchdigit(c);
     case NOT_DIGIT:
@@ -1133,10 +1247,7 @@ static int matchone(regex_t* p, char c) {
     case NOT_WHITESPACE:
       return !matchwhitespace(c);
     default:
-      if (icase) {
-        return tolower((unsigned char)p->u.ch) == tolower((unsigned char)c);
-      }
-      return (p->u.ch == c);
+      return fold_cp(char_cp(p), icase) == fold_cp(g->cp, icase);
   }
 }
 
@@ -1313,8 +1424,9 @@ static const char* match_alt(regex_t* p,
 
 /* A quantified single-node atom. Every quantifier is greedy, '?' included
  * (Emacs': "a?" on "a" matches [0,1), not the empty string): take as much
- * as the atom allows, then hand bytes back one at a time until the rest of
- * the pattern fits. */
+ * as the atom allows, then hand glyphs back one at a time until the rest
+ * of the pattern fits.  The count is in glyphs, so "å\{2\}" wants two
+ * characters, but 'pos' stays a byte pointer. */
 static const char* match_atom(regex_t* p,
                               const char* text,
                               unsigned min,
@@ -1322,22 +1434,28 @@ static const char* match_atom(regex_t* p,
                               const re_cont* k,
                               re_ctx* ctx) {
   re_span saved[RE_MAX_SPANS];
+  const char* pos = text;
   unsigned n = 0;
-  unsigned i;
 
-  while (n < max && text[n] && matchone(p, text[n]))
+  while (n < max && *pos != '\0') {
+    re_glyph g = glyph_at(pos);
+    if (!matchone(p, &g))
+      break;
+    pos += g.len;
     n++;
+  }
   if (n < min)
     return NULL;
 
   save_spans(saved, ctx->out);
-  for (i = n;; i--) {
-    const char* end = match_cont(k, text + i, ctx);
+  for (;; n--) {
+    const char* end = match_cont(k, pos, ctx);
     if (end)
       return end;
     restore_spans(ctx->out, saved);
-    if (i == min)
+    if (n == min)
       break;
+    pos = glyph_prev(text, pos);
   }
   return NULL;
 }
@@ -1365,9 +1483,9 @@ static const char* match_group(regex_t* g,
                                const re_cont* k,
                                re_ctx* ctx) {
   re_span saved[RE_MAX_SPANS];
-  const char* end;
 
   if (max > 0) {
+    const char* end;
     save_spans(saved, ctx->out);
     end = match_group_iter(g, group_end(g, ctx), text, 0, min, max, k, ctx);
     if (end)
@@ -1543,7 +1661,9 @@ static int re_matchp_internal(re_t pattern,
    * governs the first alternative alone. */
   anchored = node_type(pattern) == BEGIN && !ctx.has_branch;
 
-  do {
+  /* The scan advances a glyph at a time, so a match can only start on a
+   * character boundary and an empty match is still tried at the end. */
+  for (;;) {
     const char* end;
     reset_spans(out);
     end = match_seq(pattern, ctx.prog_end, text + idx, NULL, &ctx);
@@ -1551,9 +1671,10 @@ static int re_matchp_internal(re_t pattern,
       *matchlength = (int)(end - (text + idx));
       return idx;
     }
-    if (anchored)
+    if (anchored || text[idx] == '\0')
       break;
-  } while (text[idx++] != '\0');
+    idx += (int)glyph_at(text + idx).len;
+  }
 
   return -1;
 }

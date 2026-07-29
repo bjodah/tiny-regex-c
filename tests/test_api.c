@@ -548,9 +548,6 @@ int main(void) {
           {"[[:blank:]]", "a", 0, {{0, 0}}, 0},
           {"[[:word:]]", "_a", 1, {{1, 2}}, 0},
           {"[[:ascii:]]", "a", 1, {{0, 1}}, 0},
-          /* byte-oriented: this is the lead byte of the two-byte 'å'.
-           * kg's wrapper widens such a span to the whole glyph. */
-          {"[[:nonascii:]]", "a\xc3\xa5", 1, {{1, 2}}, 0},
           /* '^' holds at the start of the subject, not where the scan
            * resumes */
           {"^a", "aba", 1, {{0, 1}}, 0},
@@ -566,6 +563,59 @@ int main(void) {
           {"ab?", "ab", 1, {{0, 2}}, 0},
           {"[ab][ab]?", "baab1acc", 1, {{0, 2}}, 0},
           {"c[^a]?", "bc1cacc.", 1, {{1, 3}}, 0},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
+    /* Test 12b: the matcher steps by character, not by byte.  Spans stay
+     * byte offsets, so the expected numbers below are byte counts of
+     * whole glyphs.  Every case was checked against "emacs -Q --batch"
+     * first, converting its character offsets to byte offsets. */
+    {
+      static const struct span_case cases[] = {
+          /* '.' consumes a whole glyph, and an interval counts glyphs */
+          {".", "\xc3\xa5" "bc", 1, {{0, 2}}, 0},
+          {".\\{2\\}", "\xc3\xa5" "bc", 1, {{0, 3}}, 0},
+          {".\\{3\\}", "\xc3\xa5\xe6\x97\xa5\xf0\x9f\x99\x82", 1, {{0, 9}}, 0},
+          {"a.b", "a\xf0\x9f\x99\x82" "b", 1, {{0, 6}}, 0},
+          {".*", "\xc3\xa5" "b", 1, {{0, 3}}, 0},
+          {"x.\\{2,3\\}y", "x\xc3\xa5\xe6\x97\xa5y", 1, {{0, 7}}, 0},
+          /* a multi-byte literal is one atom, quantified as one */
+          {"\xc3\xa5+", "\xc3\xa5\xc3\xa5\xc3\xa5", 1, {{0, 6}}, 0},
+          {"\xc3\xa5*b", "b", 1, {{0, 1}}, 0},
+          {"\\(\xc3\xa5\\)\\{2\\}b", "\xc3\xa5\xc3\xa5" "b", 2,
+           {{0, 5}, {2, 4}}, 0},
+          {"\xc3\xb6\\|\xc3\xa4", "\xc3\xa4", 1, {{0, 2}}, 0},
+          /* class members are glyphs: 'ä' matches, the shared 0xc3 lead
+           * byte of 'ö' does not */
+          {"[\xc3\xa5\xc3\xa4]", "\xc3\xa4", 1, {{0, 2}}, 0},
+          {"[\xc3\xa5\xc3\xa4]", "\xc3\xb6", 0, {{0, 0}}, 0},
+          {"[\xc3\xa5\xc3\xa4]", "\xc3\xb6\xc3\xa4", 1, {{2, 4}}, 0},
+          {"[^\xc3\xa5]", "\xc3\xa5\xc3\xa4", 1, {{2, 4}}, 0},
+          /* a range with a multi-byte endpoint compares codepoints, as
+           * Emacs does: "[à-é]" holds ç but not ê */
+          {"[\xc3\xa0-\xc3\xa9]", "\xc3\xa7", 1, {{0, 2}}, 0},
+          {"[\xc3\xa0-\xc3\xa9]", "\xc3\xaa", 0, {{0, 0}}, 0},
+          {"[a-\xc3\xbf]", "\xc3\xa5", 1, {{0, 2}}, 0},
+          /* "[:ascii:]" and "[:nonascii:]" now mean what they say */
+          {"[[:ascii:]]", "\xc3\xa5" "a", 1, {{2, 3}}, 0},
+          {"[[:nonascii:]]", "a\xc3\xa5", 1, {{1, 3}}, 0},
+          {"[^[:ascii:]]", "a\xc3\xa5", 1, {{1, 3}}, 0},
+          /* invalid UTF-8 is not an error: each stray byte is its own
+           * glyph, so '.' takes exactly one of them and a stray lead byte
+           * is not the character it would have led */
+          {".", "\xc3", 1, {{0, 1}}, 0},
+          {".\\{2\\}", "\xc3\xc3", 1, {{0, 2}}, 0},
+          {".\\{2\\}", "\xc3\xc3\xa5", 1, {{0, 3}}, 0},
+          {"[\xc3\xa5]", "\xc3", 0, {{0, 0}}, 0},
+          {"[[:nonascii:]]", "\xc3", 1, {{0, 1}}, 0},
+          /* "\xXX" still spells a byte: a non-ASCII one only matches
+           * where it stands alone */
+          {"\\xc3", "\xc3", 1, {{0, 1}}, 0},
+          {"\\xc3", "\xc3\xa5", 0, {{0, 0}}, 0},
+          {"\\x61", "a", 1, {{0, 1}}, 0},
       };
       size_t i;
       for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
