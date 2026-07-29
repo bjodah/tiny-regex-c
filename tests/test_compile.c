@@ -53,12 +53,21 @@ int main(void)
     /* Tests 7-12: invalid quantifiers. */
     /* note that python and perl allows these, and matches them exact. */
     // "{2}", "x{}", "x{1,2,}", "x{,2,}", "x{-2}",
+    /* intervals Emacs rejects; they used to compile as the literal
+     * characters of their own spelling */
+    "a\\{2,1\\}", "a\\{65536\\}", "a\\{x\\}", "a\\{1,2,3\\}", "a\\{1", "\\{",
+    /* POSIX class names Emacs rejects, or whose meaning a byte-oriented
+     * matcher cannot honour; they used to become a set of the characters
+     * spelling the name, so "[[:blank:]]" matched 'a' */
+    "[[:foo:]]", "[[:multibyte:]]",
   };
   /* Indices 5,6,7 are overlong char-classes that re_compile() currently
    * accepts instead of rejecting; documented as a known bug (xfail). An
    * unexpected rejection there is an XPASS that fails CI. */
   const size_t ntests_invalid = sizeof(tests)/sizeof(*tests);
-  const int xfail_invalid[] = {0,0,0,0,0,1,1,1,0,0,0};
+  const int xfail_invalid[] = {0,0,0,0,0,1,1,1,0,0,0,
+                               0,0,0,0,0,0,
+                               0,0};
 
   for (i = 0; i < ntests_invalid; i++)
   {

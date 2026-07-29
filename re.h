@@ -13,7 +13,7 @@
  *   '$'        End anchor, matches end of string
  *   '*'        Asterisk, match zero or more (greedy)
  *   '+'        Plus, match one or more (greedy)
- *   '?'        Question, match zero or one (non-greedy)
+ *   '?'        Question, match zero or one (greedy)
  *   '[abc]'    Character class, match if one of {'a', 'b', 'c'}
  *   '[^abc]'   Inverted class, match if NOT one of {'a', 'b', 'c'}
  *   '[a-zA-Z]' Character ranges, the character set of the ranges { a-z | A-Z }
@@ -29,7 +29,16 @@
  *   '\{n\}'    Match n times
  *   '\{n,\}'   Match n or more times
  *   '\{,m\}'   Match m or less times
- *   '\{n,m\}'  Match n to m times
+ *   '\{n,m\}'  Match n to m times; counts run 0 to 65535 and m may not be
+ *              below n.  Anything else between the braces, and an
+ *              unterminated '\{', is a bad pattern -- it is never read as
+ *              the literal characters it is spelled with.  Where there is
+ *              nothing to repeat (pattern, group or alternative start),
+ *              '\{' is a literal '{', as in Emacs.
+ *   '[[:x:]]'  POSIX class inside a bracket expression: alnum, alpha,
+ *              ascii, blank, cntrl, digit, graph, lower, nonascii, print,
+ *              punct, space, upper, word, xdigit.  Any other name is a bad
+ *              pattern rather than a set of the characters spelling it.
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
  *
  */
@@ -82,6 +91,14 @@ re_status re_compile_checked(const char* pattern,
                              unsigned* storage_size,
                              re_t* out);
 
+/* Search `text` for the leftmost match at or after `start_offset`.
+ *
+ * `start_offset` says where to resume scanning; it does not redefine the
+ * start of the subject.  '^' holds at `text` itself and nowhere else, so a
+ * '^'-anchored pattern cannot match at a non-zero `start_offset`, and '$'
+ * holds at `text`'s terminator.  Callers matching line by line therefore
+ * pass the whole line as `text` and use `start_offset` only to advance
+ * within it.  Reported spans are offsets from `text`. */
 re_status re_exec(re_t regex,
                   const char* text,
                   int start_offset,

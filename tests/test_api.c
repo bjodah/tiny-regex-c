@@ -12,13 +12,35 @@
 
 /* A pattern, a subject and the spans GNU Emacs reports for it.  nspans 0
  * means "must not match"; a span of {-1, -1} is a group that did not
- * participate. */
+ * participate.  'offset' is re_exec()'s start_offset, i.e. where the scan
+ * resumes -- never where the subject begins. */
 struct span_case {
   const char* pattern;
   const char* text;
   int nspans;
   int spans[3][2];
+  int offset;
 };
+
+/* A pattern and the status re_compile_checked() must report for it. */
+struct compile_case {
+  const char* pattern;
+  re_status status;
+};
+
+static int check_compile(const struct compile_case* c) {
+  unsigned char storage[512];
+  unsigned size = sizeof(storage);
+  re_t regex = NULL;
+  re_status status =
+      re_compile_checked(c->pattern, RE_FLAG_NONE, storage, &size, &regex);
+
+  if (status == c->status)
+    return 0;
+  fprintf(stderr, "FAIL: re_compile_checked(\"%s\") returned %d, expected %d\n",
+          c->pattern, status, c->status);
+  return 1;
+}
 
 /* Run one span_case and report how many checks it failed. */
 static int check_spans(const struct span_case* c) {
@@ -37,7 +59,7 @@ static int check_spans(const struct span_case* c) {
     return 1;
   }
 
-  status = re_exec(regex, c->text, 0, &res);
+  status = re_exec(regex, c->text, c->offset, &res);
   if (c->nspans == 0) {
     if (status == RE_STATUS_OK)
       fprintf(stderr, "FAIL: \"%s\" matched \"%s\" [%d, %d)\n", c->pattern,
@@ -468,34 +490,125 @@ int main(void) {
     {
       static const struct span_case cases[] = {
           /* the reported end used to run past the end of the subject */
-          {"a*.c+", "ac", 1, {{0, 2}}},
-          {"\\(.*.a\\{2\\}\\)", "baa", 2, {{0, 3}, {0, 3}}},
-          {"[a-c]+\\w\\{2\\}b", "baab", 1, {{0, 4}}},
-          {"\\w*.\\{3\\}a?[a-c]\\{1\\}", "b11bZZZ", 1, {{0, 4}}},
+          {"a*.c+", "ac", 1, {{0, 2}}, 0},
+          {"\\(.*.a\\{2\\}\\)", "baa", 2, {{0, 3}, {0, 3}}, 0},
+          {"[a-c]+\\w\\{2\\}b", "baab", 1, {{0, 4}}, 0},
+          {"\\w*.\\{3\\}a?[a-c]\\{1\\}", "b11bZZZ", 1, {{0, 4}}, 0},
           /* "\|" separates whole alternatives, not just the atom before it */
-          {"foo\\|bar", "bar", 1, {{0, 3}}},
-          {"ab\\|cd", "cd", 1, {{0, 2}}},
-          {"za\\|b", "zb", 1, {{1, 2}}},
-          {"\\(ab\\)\\|\\(cd\\)", "cd", 3, {{0, 2}, {-1, -1}, {0, 2}}},
-          {"x\\(ab\\|cd\\)y", "xcdy", 2, {{0, 4}, {1, 3}}},
-          {"\\(a\\|ab\\)c", "abc", 2, {{0, 3}, {0, 2}}},
-          {"ab\\|cd", "ac", 0, {{0, 0}}},
+          {"foo\\|bar", "bar", 1, {{0, 3}}, 0},
+          {"ab\\|cd", "cd", 1, {{0, 2}}, 0},
+          {"za\\|b", "zb", 1, {{1, 2}}, 0},
+          {"\\(ab\\)\\|\\(cd\\)", "cd", 3, {{0, 2}, {-1, -1}, {0, 2}}, 0},
+          {"x\\(ab\\|cd\\)y", "xcdy", 2, {{0, 4}, {1, 3}}, 0},
+          {"\\(a\\|ab\\)c", "abc", 2, {{0, 3}, {0, 2}}, 0},
+          {"ab\\|cd", "ac", 0, {{0, 0}}, 0},
           /* groups and intervals give input back when what follows needs it */
-          {"^\\(.*\\),\\(.*\\)$", "a,b", 3, {{0, 3}, {0, 1}, {2, 3}}},
-          {".\\{2,3\\}c", "abc", 1, {{0, 3}}},
-          {"a\\{2,3\\}a", "aaa", 1, {{0, 3}}},
-          {"a\\{2,\\}a", "aaa", 1, {{0, 3}}},
-          {"a\\{,3\\}a", "aaa", 1, {{0, 3}}},
-          {"\\(.*\\)x", "yx", 2, {{0, 2}, {0, 1}}},
-          {"\\(a*\\)a", "aa", 2, {{0, 2}, {0, 1}}},
-          {"\\(a+\\)a", "aa", 2, {{0, 2}, {0, 1}}},
-          {"\\(a\\{2\\}\\)a", "aaa", 2, {{0, 3}, {0, 2}}},
-          {"\\(a\\{2\\}\\)a", "aa", 0, {{0, 0}}},
-          {"\\(.*\\)x", "y", 0, {{0, 0}}},
+          {"^\\(.*\\),\\(.*\\)$", "a,b", 3, {{0, 3}, {0, 1}, {2, 3}}, 0},
+          {".\\{2,3\\}c", "abc", 1, {{0, 3}}, 0},
+          {"a\\{2,3\\}a", "aaa", 1, {{0, 3}}, 0},
+          {"a\\{2,\\}a", "aaa", 1, {{0, 3}}, 0},
+          {"a\\{,3\\}a", "aaa", 1, {{0, 3}}, 0},
+          {"\\(.*\\)x", "yx", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(a*\\)a", "aa", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(a+\\)a", "aa", 2, {{0, 2}, {0, 1}}, 0},
+          {"\\(a\\{2\\}\\)a", "aaa", 2, {{0, 3}, {0, 2}}, 0},
+          {"\\(a\\{2\\}\\)a", "aa", 0, {{0, 0}}, 0},
+          {"\\(.*\\)x", "y", 0, {{0, 0}}, 0},
       };
       size_t i;
       for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
         failed += check_spans(&cases[i]);
+    }
+
+    /* Test 12: intervals, POSIX class names, '^' anchoring and greedy
+     * '?'.  Spans are GNU Emacs' again. */
+    {
+      static const struct span_case cases[] = {
+          /* an interval bound may be zero, and the two may be equal */
+          {"x\\{0,1\\}", "x", 1, {{0, 1}}, 0},
+          {"a\\{0\\}", "aaa", 1, {{0, 0}}, 0},
+          {"a\\{,0\\}", "aaa", 1, {{0, 0}}, 0},
+          {"a\\{\\}", "aaa", 1, {{0, 0}}, 0},
+          {"a\\{,\\}", "aaa", 1, {{0, 3}}, 0},
+          {"a\\{2,2\\}", "aaa", 1, {{0, 2}}, 0},
+          {"a\\{2,2\\}", "a", 0, {{0, 0}}, 0},
+          {"\\(a\\)\\{0\\}", "aa", 2, {{0, 0}, {-1, -1}}, 0},
+          {"\\(a\\)\\{0,1\\}", "aa", 2, {{0, 1}, {0, 1}}, 0},
+          {"\\(ab\\)\\{0\\}c", "abc", 2, {{2, 3}, {-1, -1}}, 0},
+          {"\\(a\\)\\{2,3\\}", "aaaa", 2, {{0, 3}, {2, 3}}, 0},
+          /* nothing to repeat: Emacs reads "\{" as a literal '{' */
+          {"\\{2\\}", "{2}", 1, {{0, 3}}, 0},
+          {"\\(\\{2\\}\\)", "{2}", 2, {{0, 3}, {0, 3}}, 0},
+          {"^\\{2\\}", "{2}", 1, {{0, 3}}, 0},
+          {"^\\{2\\}a", "a", 0, {{0, 0}}, 0},
+          {"a\\{2\\}", "{2}", 0, {{0, 0}}, 0},
+          /* POSIX class names, which used to degrade to a set of the
+           * characters spelling them */
+          {"[[:blank:]]", "a\tb", 1, {{1, 2}}, 0},
+          {"[[:blank:]]", "a", 0, {{0, 0}}, 0},
+          {"[[:word:]]", "_a", 1, {{1, 2}}, 0},
+          {"[[:ascii:]]", "a", 1, {{0, 1}}, 0},
+          /* byte-oriented: this is the lead byte of the two-byte 'å'.
+           * kg's wrapper widens such a span to the whole glyph. */
+          {"[[:nonascii:]]", "a\xc3\xa5", 1, {{1, 2}}, 0},
+          /* '^' holds at the start of the subject, not where the scan
+           * resumes */
+          {"^a", "aba", 1, {{0, 1}}, 0},
+          {"^a", "aba", 0, {{0, 0}}, 1},
+          {"^b", "ab", 0, {{0, 0}}, 1},
+          {"^a\\|b", "ab", 1, {{1, 2}}, 1},
+          /* '$' is unchanged: it holds at the subject's terminator */
+          {"a$", "aba", 1, {{2, 3}}, 1},
+          /* '?' is greedy, like Emacs' */
+          {"a?", "a", 1, {{0, 1}}, 0},
+          {"x?x", "x", 1, {{0, 1}}, 0},
+          {"\\(a\\)?", "a", 2, {{0, 1}, {0, 1}}, 0},
+          {"ab?", "ab", 1, {{0, 2}}, 0},
+          {"[ab][ab]?", "baab1acc", 1, {{0, 2}}, 0},
+          {"c[^a]?", "bc1cacc.", 1, {{1, 3}}, 0},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
+    /* Test 13: patterns that must be reported as bad rather than quietly
+     * reinterpreted as literal text.  Emacs signals an error for every
+     * BAD_PATTERN entry here and accepts every OK one. */
+    {
+      static const struct compile_case cases[] = {
+          {"x\\{0,1\\}", RE_STATUS_OK},
+          {"a\\{0\\}", RE_STATUS_OK},
+          {"a\\{2,2\\}", RE_STATUS_OK},
+          {"a\\{65535\\}", RE_STATUS_OK},
+          {"a\\{2,1\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{3,1\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{65536\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{,65536\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{100000\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{99999999999999\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{x\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{ 1\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{-1\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{1,2,3\\}", RE_STATUS_BAD_PATTERN},
+          {"a\\{1", RE_STATUS_BAD_PATTERN},
+          {"\\{", RE_STATUS_BAD_PATTERN},
+          {"[[:blank:]]", RE_STATUS_OK},
+          {"[[:word:]]", RE_STATUS_OK},
+          {"[[:nonascii:]]", RE_STATUS_OK},
+          {"[[:foo:]]", RE_STATUS_BAD_PATTERN},
+          {"[[:Alpha:]]", RE_STATUS_BAD_PATTERN},
+          {"[[:digitx:]]", RE_STATUS_BAD_PATTERN},
+          {"[[::]]", RE_STATUS_BAD_PATTERN},
+          /* Emacs accepts these two, but their meaning is a property of
+           * the string's representation, which a byte matcher cannot
+           * answer; rejecting beats answering wrongly. */
+          {"[[:multibyte:]]", RE_STATUS_BAD_PATTERN},
+          {"[[:unibyte:]]", RE_STATUS_BAD_PATTERN},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_compile(&cases[i]);
     }
   }
 

@@ -35,18 +35,18 @@ b[k-z]*		"ab"		1
 ^0\|		"x0"		0
 \d\d?:\d\d?:\d\d?		"0:0:0"		5
 \d\d?:\d\d?:\d\d?		"0:00:0"	6
-\d\d?:\d\d?:\d\d?		"0:0:00"	5
+\d\d?:\d\d?:\d\d?		"0:0:00"	6
 \d\d?:\d\d?:\d\d?		"00:0:0"	6
 \d\d?:\d\d?:\d\d?		"00:00:0"	7
-\d\d?:\d\d?:\d\d?		"00:0:00"	6
-\d\d?:\d\d?:\d\d?		"0:00:00"	6
-\d\d?:\d\d?:\d\d?		"00:00:00"	7
-[Hh]ello [Ww]orld\s*[!]?	"Hello world !"	12
-[Hh]ello [Ww]orld\s*[!]?	"hello world !"	12
-[Hh]ello [Ww]orld\s*[!]?	"Hello World !"	12
-[Hh]ello [Ww]orld\s*[!]?	"Hello world!   "	11
-[Hh]ello [Ww]orld\s*[!]?	"Hello world  !"	13
-[Hh]ello [Ww]orld\s*[!]?	"hello World   !"	14
+\d\d?:\d\d?:\d\d?		"00:0:00"	7
+\d\d?:\d\d?:\d\d?		"0:00:00"	7
+\d\d?:\d\d?:\d\d?		"00:00:00"	8
+[Hh]ello [Ww]orld\s*[!]?	"Hello world !"	13
+[Hh]ello [Ww]orld\s*[!]?	"hello world !"	13
+[Hh]ello [Ww]orld\s*[!]?	"Hello World !"	13
+[Hh]ello [Ww]orld\s*[!]?	"Hello world!   "	12
+[Hh]ello [Ww]orld\s*[!]?	"Hello world  !"	14
+[Hh]ello [Ww]orld\s*[!]?	"hello World   !"	15
 .?bar			"real_bar"			4
 [a-z]+\nbreak		"blahblah\nbreak"		14
 [a-z\s]+\nbreak		"bla bla \nbreak"		14
@@ -108,3 +108,30 @@ a\{,3\}a		"aaa"		3
 \(a+\)a		"aa"		2
 \(.+\)c		"bc"		2
 \(a\{2\}\)a		"aaa"		3
+# Emacs' intervals: a bound may be 0, the bounds may be equal, and a form
+# with nothing to repeat is a literal '{'. None of these used to compile;
+# they degraded to the literal characters of their own spelling.
+x\{0,1\}		"x"		1
+a\{0\}			"aaa"		0
+a\{,0\}			"aaa"		0
+a\{\}			"aaa"		0
+a\{,\}			"aaa"		3
+a\{0,\}			"aaa"		3
+a\{2,2\}		"aaa"		2
+a\{1,1\}		"aaa"		1
+a\{0,3\}		"aaa"		3
+\{2\}			"{2}"		3
+\(\{2\}\)		"{2}"		3
+\(a\)\{0\}		"aa"		0
+\(ab\)\{0\}c		"abc"		1
+# POSIX class names Emacs knows. "[[:blank:]]" used to match 'a', out of
+# the letters spelling the class name.
+[[:blank:]]		"a\tb"		1
+[[:word:]]		"_a"		1
+[[:ascii:]]		"a"		1
+# Emacs' '?' is greedy.
+a?			"a"		1
+x?x			"x"		1
+ab?			"ab"		2
+[ab][ab]?		"baab1acc"	2
+c[^a]?			"bc1cacc."	2

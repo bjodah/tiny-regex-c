@@ -13,7 +13,7 @@
  *   '$'        End anchor, matches end of string
  *   '*'        Asterisk, match zero or more (greedy)
  *   '+'        Plus, match one or more (greedy)
- *   '?'        Question, match zero or one (non-greedy)
+ *   '?'        Question, match zero or one (greedy)
  *   '[abc]'    Character class, match if one of {'a', 'b', 'c'}
  *   '[^abc]'   Inverted class, match if NOT one of {'a', 'b', 'c'}
  *   '[a-zA-Z]' Character ranges, the character set of the ranges { a-z | A-Z }
@@ -29,7 +29,8 @@
  *   '\{n\}'    Match n times
  *   '\{n,\}'   Match n or more times
  *   '\{,m\}'   Match m or less times
- *   '\{n,m\}'  Match n to m times
+ *   '\{n,m\}'  Match n to m times; see re.h for what makes an interval or a
+ *              POSIX class name a bad pattern rather than literal text
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
  *
  * TODO:
@@ -58,6 +59,16 @@
 #endif
 
 #define MAX_REGEXP_LEN 70
+
+/* Largest count a "\{n,m\}" interval may spell.  This is the value Emacs
+ * accepts up to (its RE_DUP_MAX, a name <limits.h> also defines, hence the
+ * spelling here), and it is also the widest value the compiled node's
+ * 16-bit count fields hold, so an accepted count is always representable. */
+#define RE_INTERVAL_MAX 65535
+
+/* quant_bounds()' "no upper bound" marker.  A spelled count never reaches
+ * it, RE_INTERVAL_MAX being the largest one a pattern can express. */
+#define RE_REP_INF UINT_MAX
 
 /* Bound on the number of times a quantified group ("\(...\)+" etc.) is
  * expanded. Each repetition is one more frame on the C stack, so this caps
@@ -234,6 +245,7 @@ static int matchmetachar(char c, const char* str);
 static int matchrange(char c, const char* str, int icase);
 static int matchdot(char c);
 static int ismetachar(char c);
+static int named_class_len(const char* str);
 static int hex(char c);
 static int re_matchp_internal(re_t pattern,
                               const char* text,
@@ -378,6 +390,11 @@ static int compile_charclass(const char* pattern,
       const char* end = strstr(&pattern[i + 2], ":]");
       if (end) {
         int length = (end + 2) - &pattern[i];
+        /* A class name this engine does not know is a bad pattern, as it
+         * is in Emacs -- never the literal characters of its spelling,
+         * which is how "[[:blank:]]" came to match 'a'. */
+        if (named_class_len(&pattern[i]) != length)
+          return 0;
         if (RE_CCL_DAT(compiled) + char_index + length >= storage_end)
           return 0;
         memcpy(RE_CCL_DAT(compiled) + char_index, &pattern[i], length);
@@ -404,6 +421,80 @@ static int compile_charclass(const char* pattern,
   RE_CCL_DAT(compiled)[char_index] = '\0';
   *pattern_index = i;
   return 1;
+}
+
+/* Read a decimal interval count from [*s, end).  Advances *s past the
+ * digits and reports through *have whether there were any.  Returns 0 for
+ * a count past RE_INTERVAL_MAX, which Emacs rejects. */
+static int parse_count(const char** s,
+                       const char* end,
+                       unsigned* val,
+                       int* have) {
+  const char* p = *s;
+  unsigned v = 0;
+
+  while (p < end && *p >= '0' && *p <= '9') {
+    v = v * 10 + (unsigned)(*p - '0');
+    if (v > RE_INTERVAL_MAX)
+      return 0;
+    p++;
+  }
+  *have = p != *s;
+  *val = v;
+  *s = p;
+  return 1;
+}
+
+/* Compile the interval whose contents run [s, end) -- the text between
+ * "\{" and "\}" -- into 'node'.  The accepted forms are Emacs': "{n}",
+ * "{n,}", "{,m}" and "{n,m}", an absent bound meaning 0 below and
+ * unbounded above, so "{}" is exactly zero and "{,}" is "any number".
+ * Returns 0 for what Emacs rejects: anything but digits and one comma, or
+ * an upper bound below the lower one. */
+static int compile_interval(const char* s, const char* end, regex_t* node) {
+  unsigned n = 0, m = 0;
+  int have_n = 0, have_m = 0, comma = 0;
+
+  if (!parse_count(&s, end, &n, &have_n))
+    return 0;
+  if (s < end && *s == ',') {
+    comma = 1;
+    s++;
+    if (!parse_count(&s, end, &m, &have_m))
+      return 0;
+  }
+  if (s != end)
+    return 0;
+
+  if (!comma) {
+    node->type = TIMES;
+    node->u.n = (unsigned short)n;
+  } else if (!have_m) {
+    node->type = TIMES_N;
+    node->u.n = (unsigned short)n;
+  } else if (!have_n) {
+    node->type = TIMES_M;
+    node->u.m = (unsigned short)m;
+  } else {
+    if (m < n)
+      return 0;
+    node->type = TIMES_NM;
+    node->u.n = (unsigned short)n;
+    node->u.m = (unsigned short)m;
+  }
+  return 1;
+}
+
+/* Whether a quantifier written at node index 'j' has an atom to repeat.
+ * At the start of the pattern, of a group or of an alternative, and after
+ * an anchor, there is none, and Emacs reads "\{" there as a literal '{'. */
+static int quantifiable(unsigned char* re_data, int j) {
+  unsigned short type;
+
+  if (j <= 0)
+    return 0;
+  type = getindex((regex_t*)re_data, j - 1)->type & ~RE_TYPE_ICASE;
+  return type != GROUP && type != BRANCH && type != BEGIN && type != END;
 }
 
 re_t re_compile_to(const char* pattern,
@@ -542,62 +633,24 @@ re_t re_compile_to(const char* pattern,
               re_compiled->type = BRANCH;
             } break;
             case '{': {
-              unsigned short n, m;
+              /* An interval, up to the closing "\}".  An unterminated one
+               * is a bad pattern ("Unmatched \{" in Emacs), and so are
+               * contents Emacs rejects -- never the literal characters of
+               * the interval's own spelling.  With nothing to repeat, the
+               * "\{" is Emacs' literal '{' and parsing resumes after it. */
               const char* p = &pattern[i + 1];
-              while (*p != '\0') {
-                if (*p == '\\' && *(p + 1) == '}') {
-                  break;
-                }
+              while (*p != '\0' && !(*p == '\\' && *(p + 1) == '}'))
                 p++;
+              if (*p == '\0')
+                return 0;
+              if (!quantifiable(re_data, j)) {
+                re_compiled->type = CHAR;
+                re_compiled->u.ch = '{';
+                break;
               }
-              re_compiled->type = CHAR;
-              re_compiled->u.ch = '{';
-              if (*p != '\0' && j > 0) {
-                char buf[64];
-                int len = p - &pattern[i];
-                if (len > 0 && len < (int)sizeof(buf) - 1) {
-                  memcpy(buf, &pattern[i], len);
-                  buf[len] = '}';
-                  buf[len + 1] = '\0';
-                  if (2 == sscanf(buf, "{%hu,%hu}", &n, &m)) {
-                    if (!(n == 0 || m == 0 || n > 32767 || m > 32767 ||
-                          m <= n || buf[len - 1] == ',')) {
-                      re_compiled->type = TIMES_NM;
-                      re_compiled->u.n = n;
-                      re_compiled->u.m = m;
-                    }
-                  } else {
-                    int o = -1;
-                    if (1 == sscanf(buf, "{%hu,}%n", &n, &o) && o >= 0 &&
-                        n > 0 && n <= 32767) {
-                      re_compiled->type = TIMES_N;
-                      re_compiled->u.n = n;
-                    } else if (1 == sscanf(buf, "{,%hu}", &m) &&
-                               buf[len - 1] != ',' && m > 0 && m <= 32767) {
-                      re_compiled->type = TIMES_M;
-                      re_compiled->u.m = m;
-                    } else if (1 == sscanf(buf, "{%hu}", &n) && n > 0 &&
-                               n <= 32767) {
-                      re_compiled->type = TIMES;
-                      re_compiled->u.n = n;
-                    }
-                  }
-                }
-              }
-              if (re_compiled->type != CHAR) {
-                i = (p - pattern) + 1;
-              } else {
-                if (RE_HAS_ROOM(getnext(re_compiled))) {
-                  re_compiled->type = CHAR;
-                  re_compiled->u.ch = '\\';
-                  re_compiled = getnext(re_compiled);
-                  re_compiled->type = CHAR;
-                  re_compiled->u.ch = '{';
-                  j += 1;
-                } else {
-                  return 0;
-                }
-              }
+              if (!compile_interval(&pattern[i + 1], p, re_compiled))
+                return 0;
+              i = (p - pattern) + 1;
             } break;
             case 'x': {
               /* \xXX. An invalid escape here falls back to emitting the
@@ -901,6 +954,20 @@ static int matchpunct(char c) {
 static int matchxdigit(char c) {
   return isxdigit((unsigned char)c);
 }
+static int matchblank(char c) {
+  return c == ' ' || c == '\t';
+}
+/* Emacs' "[:word:]" is the buffer's word syntax; for ASCII text that is
+ * the alphanumerics, and unlike "\w" it excludes '_'. */
+static int matchword(char c) {
+  return isalnum((unsigned char)c);
+}
+static int matchascii(char c) {
+  return (unsigned char)c < 0x80;
+}
+static int matchnonascii(char c) {
+  return (unsigned char)c >= 0x80;
+}
 static int matchlower(char c) {
   return islower((unsigned char)c);
 }
@@ -921,26 +988,47 @@ struct named_class {
   char_matcher match[2];
 };
 
-static int matchnamedclass(char c, const char** str, int icase) {
-  static const struct named_class classes[] = {
-      {"[:digit:]", 9, {matchdigit, matchdigit}},
-      {"[:alpha:]", 9, {matchalpha, matchalpha}},
-      {"[:alnum:]", 9, {matchposixalnum, matchposixalnum}},
-      {"[:space:]", 9, {matchwhitespace, matchwhitespace}},
-      {"[:cntrl:]", 9, {matchcontrol, matchcontrol}},
-      {"[:graph:]", 9, {matchgraph, matchgraph}},
-      {"[:print:]", 9, {matchprint, matchprint}},
-      {"[:punct:]", 9, {matchpunct, matchpunct}},
-      {"[:xdigit:]", 10, {matchxdigit, matchxdigit}},
-      {"[:lower:]", 9, {matchlower, matchalpha}},
-      {"[:upper:]", 9, {matchupper, matchalpha}},
-  };
+/* The POSIX class names this engine honours.  Emacs also accepts
+ * "[:multibyte:]" and "[:unibyte:]", whose meaning is a property of the
+ * string's representation rather than of the byte; a byte-oriented matcher
+ * cannot answer them, so compile_charclass() rejects those (and every
+ * unknown name) instead of quietly reading it as a set of characters. */
+static const struct named_class named_classes[] = {
+    {"[:digit:]", 9, {matchdigit, matchdigit}},
+    {"[:alpha:]", 9, {matchalpha, matchalpha}},
+    {"[:alnum:]", 9, {matchposixalnum, matchposixalnum}},
+    {"[:space:]", 9, {matchwhitespace, matchwhitespace}},
+    {"[:blank:]", 9, {matchblank, matchblank}},
+    {"[:cntrl:]", 9, {matchcontrol, matchcontrol}},
+    {"[:graph:]", 9, {matchgraph, matchgraph}},
+    {"[:print:]", 9, {matchprint, matchprint}},
+    {"[:punct:]", 9, {matchpunct, matchpunct}},
+    {"[:xdigit:]", 10, {matchxdigit, matchxdigit}},
+    {"[:lower:]", 9, {matchlower, matchalpha}},
+    {"[:upper:]", 9, {matchupper, matchalpha}},
+    {"[:word:]", 8, {matchword, matchword}},
+    {"[:ascii:]", 9, {matchascii, matchascii}},
+    {"[:nonascii:]", 12, {matchnonascii, matchnonascii}},
+};
 
-  for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
-    if (strncmp(*str, classes[i].name, classes[i].length) != 0)
+/* The spelled-out length of the named class at 'str', or 0 when the name
+ * is not one this engine knows. */
+static int named_class_len(const char* str) {
+  for (unsigned i = 0; i < sizeof(named_classes) / sizeof(named_classes[0]);
+       i++) {
+    if (strncmp(str, named_classes[i].name, named_classes[i].length) == 0)
+      return named_classes[i].length;
+  }
+  return 0;
+}
+
+static int matchnamedclass(char c, const char** str, int icase) {
+  for (unsigned i = 0; i < sizeof(named_classes) / sizeof(named_classes[0]);
+       i++) {
+    if (strncmp(*str, named_classes[i].name, named_classes[i].length) != 0)
       continue;
-    *str += classes[i].length - 1;
-    return classes[i].match[!!icase](c) * 2 - 1;
+    *str += named_classes[i].length - 1;
+    return named_classes[i].match[!!icase](c) * 2 - 1;
   }
   return 0;
 }
@@ -1082,14 +1170,15 @@ typedef struct re_cont {
   unsigned char kind;
   regex_t* p;
   regex_t* stop;
-  const char* iter;        /* CONT_REP: where this repetition began */
-  unsigned short min, max; /* CONT_REP: bounds; max == 0 is unbounded */
-  unsigned short done;     /* CONT_REP: repetitions completed */
+  const char* iter;  /* CONT_REP: where this repetition began */
+  unsigned min, max; /* CONT_REP: bounds; RE_REP_INF max is unbounded */
+  unsigned done;     /* CONT_REP: repetitions completed */
 } re_cont;
 
 typedef struct {
-  const char* text_start; /* offset 0 for reported spans */
-  const char* anchor;     /* the only place '^' can match */
+  const char* text_start; /* offset 0 for reported spans, and where '^'
+                           * holds -- re_exec()'s start_offset says where
+                           * to resume scanning, not where the line begins */
   regex_t* prog_end;      /* the UNUSED sentinel */
   re_match_result* out;
   int has_branch; /* whether the pattern contains '\|' at all */
@@ -1105,9 +1194,9 @@ static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx);
 static const char* match_group_iter(regex_t* g,
                                     regex_t* gend,
                                     const char* text,
-                                    unsigned short done,
-                                    unsigned short min,
-                                    unsigned short max,
+                                    unsigned done,
+                                    unsigned min,
+                                    unsigned max,
                                     const re_cont* k,
                                     re_ctx* ctx);
 
@@ -1160,25 +1249,25 @@ static regex_t* find_branch(regex_t* p, regex_t* stop, const re_ctx* ctx) {
   return NULL;
 }
 
-/* Repetition bounds of the quantifier node 'p'; max 0 means unbounded. */
-static void quant_bounds(const regex_t* p,
-                         unsigned short* min,
-                         unsigned short* max) {
+/* Repetition bounds of the quantifier node 'p'; RE_REP_INF max means
+ * unbounded.  A finite max of 0 is a real bound ("a\{0\}" matches empty),
+ * so the two cannot share a spelling. */
+static void quant_bounds(const regex_t* p, unsigned* min, unsigned* max) {
   switch (node_type(p)) {
     case QUESTIONMARK:
       *min = 0, *max = 1;
       break;
     case STAR:
-      *min = 0, *max = 0;
+      *min = 0, *max = RE_REP_INF;
       break;
     case PLUS:
-      *min = 1, *max = 0;
+      *min = 1, *max = RE_REP_INF;
       break;
     case TIMES:
       *min = p->u.n, *max = p->u.n;
       break;
     case TIMES_N:
-      *min = p->u.n, *max = 0;
+      *min = p->u.n, *max = RE_REP_INF;
       break;
     case TIMES_M:
       *min = 0, *max = p->u.m;
@@ -1222,32 +1311,33 @@ static const char* match_alt(regex_t* p,
   return NULL;
 }
 
-/* A quantified single-node atom. '*', '+' and the intervals are greedy:
- * take as much as the atom allows, then hand bytes back one at a time
- * until the rest of the pattern fits. '?' is non-greedy (see re.h) and
- * grows instead of shrinking. */
+/* A quantified single-node atom. Every quantifier is greedy, '?' included
+ * (Emacs': "a?" on "a" matches [0,1), not the empty string): take as much
+ * as the atom allows, then hand bytes back one at a time until the rest of
+ * the pattern fits. */
 static const char* match_atom(regex_t* p,
                               const char* text,
-                              unsigned short min,
-                              unsigned short max,
-                              int greedy,
+                              unsigned min,
+                              unsigned max,
                               const re_cont* k,
                               re_ctx* ctx) {
   re_span saved[RE_MAX_SPANS];
   unsigned n = 0;
   unsigned i;
 
-  while ((max == 0 || n < max) && text[n] && matchone(p, text[n]))
+  while (n < max && text[n] && matchone(p, text[n]))
     n++;
   if (n < min)
     return NULL;
 
   save_spans(saved, ctx->out);
-  for (i = min; i <= n; i++) {
-    const char* end = match_cont(k, text + (greedy ? min + n - i : i), ctx);
+  for (i = n;; i--) {
+    const char* end = match_cont(k, text + i, ctx);
     if (end)
       return end;
     restore_spans(ctx->out, saved);
+    if (i == min)
+      break;
   }
   return NULL;
 }
@@ -1256,10 +1346,10 @@ static const char* match_atom(regex_t* p,
  * whether the assertion has to hold at all. */
 static const char* match_anchor(const regex_t* p,
                                 const char* text,
-                                unsigned short min,
+                                unsigned min,
                                 const re_cont* k,
                                 re_ctx* ctx) {
-  int holds = node_type(p) == BEGIN ? text == ctx->anchor : text[0] == '\0';
+  int holds = node_type(p) == BEGIN ? text == ctx->text_start : text[0] == '\0';
 
   if (!holds && min > 0)
     return NULL;
@@ -1270,18 +1360,20 @@ static const char* match_anchor(const regex_t* p,
  * Greedy: entering the group is tried before skipping it. */
 static const char* match_group(regex_t* g,
                                const char* text,
-                               unsigned short min,
-                               unsigned short max,
+                               unsigned min,
+                               unsigned max,
                                const re_cont* k,
                                re_ctx* ctx) {
   re_span saved[RE_MAX_SPANS];
   const char* end;
 
-  save_spans(saved, ctx->out);
-  end = match_group_iter(g, group_end(g, ctx), text, 0, min, max, k, ctx);
-  if (end)
-    return end;
-  restore_spans(ctx->out, saved);
+  if (max > 0) {
+    save_spans(saved, ctx->out);
+    end = match_group_iter(g, group_end(g, ctx), text, 0, min, max, k, ctx);
+    if (end)
+      return end;
+    restore_spans(ctx->out, saved);
+  }
   if (min == 0)
     return match_cont(k, text, ctx);
   return NULL;
@@ -1291,9 +1383,9 @@ static const char* match_group(regex_t* g,
 static const char* match_group_iter(regex_t* g,
                                     regex_t* gend,
                                     const char* text,
-                                    unsigned short done,
-                                    unsigned short min,
-                                    unsigned short max,
+                                    unsigned done,
+                                    unsigned min,
+                                    unsigned max,
                                     const re_cont* k,
                                     re_ctx* ctx) {
   re_span* span = group_span(ctx, g);
@@ -1319,13 +1411,13 @@ static const char* match_group_iter(regex_t* g,
  * prefer repeating the group over leaving it. */
 static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
   re_span* span = group_span(ctx, k->p);
-  unsigned short done = (unsigned short)(k->done + 1);
+  unsigned done = k->done + 1;
   int grew = text != k->iter;
 
   if (span)
     span->end = (int)(text - ctx->text_start);
 
-  if (grew && (k->max == 0 || done < k->max)) {
+  if (grew && done < k->max) {
     re_span saved[RE_MAX_SPANS];
     const char* end;
     save_spans(saved, ctx->out);
@@ -1356,10 +1448,10 @@ static const char* match_seq_body(regex_t* p,
                                   const char* text,
                                   const re_cont* k,
                                   re_ctx* ctx) {
-  unsigned short type, min = 1, max = 1;
+  unsigned short type;
+  unsigned min = 1, max = 1;
   regex_t* after;
   re_cont rest;
-  int greedy = 1;
 
   if (p >= stop || node_type(p) == UNUSED)
     return match_cont(k, text, ctx);
@@ -1373,9 +1465,6 @@ static const char* match_seq_body(regex_t* p,
   after = atom_end(p, stop, ctx);
   if (after < stop && isquantifier(node_type(after))) {
     quant_bounds(after, &min, &max);
-    /* '?' is documented non-greedy for a plain atom; on a group it has
-     * always been greedy here. D-1 will settle both on greedy. */
-    greedy = node_type(after) != QUESTIONMARK || node_type(p) == GROUP;
     after = atom_end(after, stop, ctx);
   }
 
@@ -1391,7 +1480,7 @@ static const char* match_seq_body(regex_t* p,
     return match_anchor(p, text, min, &rest, ctx);
   if (isquantifier(type))
     return NULL; /* a stray quantifier, e.g. "a*?", matches nothing */
-  return match_atom(p, text, min, max, greedy, &rest, ctx);
+  return match_atom(p, text, min, max, &rest, ctx);
 }
 
 static const char* match_seq(regex_t* p,
@@ -1417,13 +1506,11 @@ static const char* match_seq(regex_t* p,
 
 static void init_ctx(re_ctx* ctx,
                      re_t pattern,
-                     const char* text,
                      const char* text_start,
                      re_match_result* out) {
   regex_t* p = pattern;
 
   ctx->text_start = text_start;
-  ctx->anchor = text;
   ctx->out = out;
   ctx->has_branch = 0;
   while (node_type(p) != UNUSED) {
@@ -1449,10 +1536,11 @@ static int re_matchp_internal(re_t pattern,
   if (!pattern)
     return -1;
 
-  init_ctx(&ctx, pattern, text, text_start, out);
-  /* A leading '^' can only hold where the scan started, so trying later
-   * offsets is pointless -- unless a '\|' means the anchor governs the
-   * first alternative alone. */
+  init_ctx(&ctx, pattern, text_start, out);
+  /* A leading '^' can only hold at the start of the subject, so no offset
+   * past the first one is worth trying -- and when the scan resumes past
+   * it, not even that one can match.  Unless a '\|' means the anchor
+   * governs the first alternative alone. */
   anchored = node_type(pattern) == BEGIN && !ctx.has_branch;
 
   do {

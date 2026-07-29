@@ -75,7 +75,7 @@ The following features / regex-operators are supported by this library.
   -  `$`         End anchor, matches end of string
   -  `*`         Asterisk, match zero or more (greedy)
   -  `+`         Plus, match one or more (greedy)
-  -  `?`         Question, match zero or one (non-greedy)
+  -  `?`         Question, match zero or one (greedy)
   -  `[abc]`     Character class, match if one of {'a', 'b', 'c'}
   -  `[^abc]`   Inverted class, match if NOT one of {'a', 'b', 'c'}
   -  `[a-zA-Z]` Character ranges, the character set of the ranges { a-z | A-Z }
@@ -86,7 +86,9 @@ The following features / regex-operators are supported by this library.
   -  `\d`       Digits, [0-9]
   -  `\D`       Non-digits
   -  `\xXX`     Hex-encoded byte
-  -  `[[:digit:]]` POSIX bracket classes inside character classes
+  -  `[[:digit:]]` POSIX bracket classes inside character classes: alnum,
+     alpha, ascii, blank, cntrl, digit, graph, lower, nonascii, print, punct,
+     space, upper, word, xdigit
   -  `\|`       Branch Or, e.g. `a\|A`, `ab\|cd`
   -  `\{n\}`    Exact quantifier
   -  `\{n,\}`   Match n or more times
@@ -101,7 +103,20 @@ alternation, and intervals use the escaped Emacs-style forms above.
 concatenations (`ab\|cd` is `ab` or `cd`, not `a` followed by `b\|cd`),
 bounded by the enclosing `\(...\)` if there is one. Quantified groups and
 intervals backtrack, so `\(.*\),\(.*\)` and `.\{2,3\}c` behave as they do
-in Emacs.
+in Emacs.  Every quantifier is greedy, `?` included: `a?` on `a` matches
+one character, as it does in Emacs.
+
+Constructs this library cannot honour are rejected rather than
+reinterpreted.  An interval whose contents are not `n`, `n,`, `,m` or
+`n,m` (counts up to 65535, `m` not below `n`), an unterminated `\{`, and
+an unknown POSIX class name are all compile errors; they never fall back
+to matching the literal characters they are spelled with.  Where there is
+nothing to repeat -- the start of the pattern, of a group or of an
+alternative -- `\{` is the literal `{`, as in Emacs.
+
+`^` matches at the start of the subject handed to `re_exec()`, not at its
+`start_offset`: that argument says where to resume scanning, so a
+`^`-anchored pattern cannot match at a non-zero offset.
 
 ### Usage
 Compile a regex from ASCII-string (char-array) to a custom pattern structure using `re_compile()`.
