@@ -30,3 +30,8 @@ a.b		"a\nb"		0
 ab\{2\}c	"abbX"		0
 ab\{2\}c	"abb"		0
 a\(b\)c		"ab"		0
+\(a\{2\}\)a	"aa"		0
+\(.*\)x	"y"		0
+ab\|cd	"ac"		0
+foo\|bar	"baz"		0
+.\{2,3\}c	"ab"		0

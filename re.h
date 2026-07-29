@@ -24,7 +24,8 @@
  *   '\d'       Digits, [0-9]
  *   '\D'       Non-digits
  *   '\xXX'     Hex-encoded byte
- *   '\|'       Branch Or, e.g. a\|A, \w\|\s
+ *   '\|'       Branch Or; the alternatives are whole concatenations and
+ *              a group bounds them, e.g. ab\|cd, x\(ab\|cd\)y
  *   '\{n\}'    Match n times
  *   '\{n,\}'   Match n or more times
  *   '\{,m\}'   Match m or less times

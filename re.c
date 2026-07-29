@@ -24,7 +24,8 @@
  *   '\d'       Digits, [0-9]
  *   '\D'       Non-digits
  *   '\xXX'     Hex-encoded byte
- *   '\|'       Branch Or, e.g. a\|A, \w\|\s
+ *   '\|'       Branch Or; the alternatives are whole concatenations and
+ *              a group bounds them, e.g. ab\|cd, x\(ab\|cd\)y
  *   '\{n\}'    Match n times
  *   '\{n,\}'   Match n or more times
  *   '\{,m\}'   Match m or less times
@@ -58,9 +59,9 @@
 
 #define MAX_REGEXP_LEN 70
 
-/* Bound on the number of times a quantified group ("(...)+" etc.) is
- * greedily expanded before backtracking; caps the fixed-size bookkeeping
- * arrays in matchgrouptimes() rather than allocating on the heap. */
+/* Bound on the number of times a quantified group ("\(...\)+" etc.) is
+ * expanded. Each repetition is one more frame on the C stack, so this caps
+ * how far a single group can drive the matcher down. */
 #ifndef CPROVER
 #define MAX_GROUP_REPEATS 256
 #else
@@ -68,14 +69,26 @@
 #endif
 
 /* Bounds total backtracking work per top-level match attempt. Nested
- * quantified groups (e.g. "(a*)*") can force catastrophic/exponential
- * backtracking; rather than hang, matchpattern() fails the match once this
+ * quantified groups (e.g. "\(a*\)*") can force catastrophic/exponential
+ * backtracking; rather than hang, match_seq() fails the match once this
  * many steps have run. Not a formal ReDoS fix -- just a fail-fast ceiling,
  * the same spirit as fe's Lisp step budget for otherwise-unbounded input. */
 #ifndef CPROVER
 #define MAX_MATCH_STEPS 2000000
 #else
 #define MAX_MATCH_STEPS 1000 /* faster formal proofs */
+#endif
+
+/* Bounds the matcher's recursion depth. The matcher keeps its pending work
+ * on the C stack (see the continuation frames below), so a pattern that
+ * both repeats a lot and nests can grow the stack without ever running out
+ * of steps; overrunning this is reported as RE_STATUS_TOO_COMPLEX rather
+ * than smashing the stack. One unit is one match_seq() frame, a few hundred
+ * bytes of stack, so the ceiling stays comfortably under a megabyte. */
+#ifndef CPROVER
+#define MAX_MATCH_DEPTH 4096
+#else
+#define MAX_MATCH_DEPTH 64 /* faster formal proofs */
 #endif
 
 #ifdef DEBUG
@@ -174,20 +187,21 @@ static re_t getnext(regex_t* pattern) {
 
 static re_t getindex(regex_t* pattern, int index) {
   /* UNUSED terminates the compiled buffer; it is always safely in-bounds,
-   * but stepping *from* it via getnext() is not. A group whose recorded
-   * size overshoots (reachable with deeply nested quantified groups, where
-   * matchgroup()'s own num_patterns bookkeeping can be imprecise -- see
-   * matchgroup()) would otherwise walk this past the end of the buffer;
-   * clamp to the sentinel instead. */
+   * but stepping *from* it via getnext() is not. An index that overshoots
+   * the pattern -- re_compile_to()'s "\)" scan walks back over indices it
+   * has not finished writing -- would otherwise walk this past the end of
+   * the buffer; clamp to the sentinel instead. */
   for (int i = 1; i <= index && (pattern->type & ~RE_TYPE_ICASE) != UNUSED; ++i)
     pattern = getnext(pattern);
 
   return pattern;
 }
 
-/* Backtracking step counter for the current top-level match attempt; reset
- * in re_matchp() and consumed by matchpattern(). See MAX_MATCH_STEPS. */
+/* Backtracking budget for the current top-level match attempt; both are
+ * reset in re_matchp_internal() and consumed by match_seq(). See
+ * MAX_MATCH_STEPS and MAX_MATCH_DEPTH. */
 static long re_match_steps;
+static long re_match_depth;
 
 static void save_spans(re_span spans[RE_MAX_SPANS],
                        const re_match_result* out) {
@@ -211,67 +225,7 @@ static void reset_spans(re_match_result* out) {
 }
 
 /* Private function declarations: */
-static int matchpattern(regex_t* pattern,
-                        const char* text,
-                        int* matchlength,
-                        int* num_patterns,
-                        const char* text_start,
-                        re_match_result* out);
 static int matchcharclass(char c, const char* str, int icase);
-static int matchstar(regex_t* p,
-                     regex_t* pattern,
-                     const char* text,
-                     int* matchlength,
-                     const char* text_start,
-                     re_match_result* out);
-static int matchplus(regex_t* p,
-                     regex_t* pattern,
-                     const char* text,
-                     int* matchlength,
-                     const char* text_start,
-                     re_match_result* out);
-static int matchquestion(regex_t* p,
-                         regex_t* pattern,
-                         const char* text,
-                         int* matchlength,
-                         const char* text_start,
-                         re_match_result* out);
-static int matchbranch(regex_t* p,
-                       regex_t* pattern,
-                       const char* text,
-                       int* matchlength,
-                       const char* text_start,
-                       re_match_result* out);
-static int matchtimes(regex_t* p,
-                      unsigned short n,
-                      const char* text,
-                      int* matchlength);
-static int matchtimes_n(regex_t* p,
-                        unsigned short n,
-                        const char* text,
-                        int* matchlength);
-static int matchtimes_m(regex_t* p,
-                        unsigned short m,
-                        const char* text,
-                        int* matchlength);
-static int matchtimes_nm(regex_t* p,
-                         unsigned short n,
-                         unsigned short m,
-                         const char* text,
-                         int* matchlength);
-static int matchgroup(regex_t* p,
-                      const char* text,
-                      int* matchlength,
-                      const char* text_start,
-                      re_match_result* out);
-static int matchgrouptimes(regex_t* p,
-                           regex_t* pattern,
-                           const char* text,
-                           int* matchlength,
-                           unsigned short min,
-                           unsigned short max,
-                           const char* text_start,
-                           re_match_result* out);
 static int matchone(regex_t* p, char c);
 static int matchdigit(char c);
 static int matchalpha(char c);
@@ -304,46 +258,6 @@ int re_matchp(re_t pattern, const char* text, int* matchlength) {
       *matchlength = out.spans[0].end - out.spans[0].start;
     }
     return out.spans[0].start;
-  }
-  return -1;
-}
-
-static int re_matchp_internal(re_t pattern,
-                              const char* text,
-                              int* matchlength,
-                              const char* text_start,
-                              re_match_result* out) {
-  int num_patterns = 0;
-  re_match_steps = 0;
-  *matchlength = 0;
-  if (pattern != 0) {
-    if ((pattern->type & ~RE_TYPE_ICASE) == BEGIN) {
-      return ((matchpattern(getnext(pattern), text, matchlength, &num_patterns,
-                            text_start, out))
-                  ? 0
-                  : -1);
-    } else {
-      int idx = -1;
-
-      do {
-        idx += 1;
-        num_patterns = 0;
-        reset_spans(out);
-
-        if (matchpattern(pattern, text, matchlength, &num_patterns, text_start,
-                         out)) {
-          // empty branch matches null (i.e. ok, but *matchlength == 0)
-          if (*matchlength && text[0] == '\0')
-            return -1;
-
-          return idx;
-        }
-
-        //  Reset match length for the next starting point
-        *matchlength = 0;
-
-      } while (*text++ != '\0');
-    }
   }
   return -1;
 }
@@ -1130,10 +1044,6 @@ static int matchone(regex_t* p, char c) {
       return matchwhitespace(c);
     case NOT_WHITESPACE:
       return !matchwhitespace(c);
-    case GROUPEND:
-      return 1;
-    case BEGIN:
-      return 0;
     default:
       if (icase) {
         return tolower((unsigned char)p->u.ch) == tolower((unsigned char)c);
@@ -1142,437 +1052,422 @@ static int matchone(regex_t* p, char c) {
   }
 }
 
-static unsigned matchcount(regex_t* p, const char* text, unsigned max) {
-  unsigned count = 0;
-  while (*text && count < max && matchone(p, *text)) {
-    text++;
-    count++;
+/* ------------------------------------------------------------------------
+ * Backtracking matcher
+ *
+ * The compiled pattern is a flat node list; its structure -- groups,
+ * alternation, which quantifier belongs to which atom -- is recovered by
+ * walking it. Matching is stated as "match the node run [p, stop) at
+ * 'text', then run the continuation k", and a successful match returns the
+ * position in the subject it reached. Two properties follow from that
+ * shape:
+ *
+ *   - No match length is accumulated by hand on the way out, so a reported
+ *     span cannot end past the subject.
+ *   - Every construct backtracks, because a choice only succeeds if the
+ *     continuation it installed succeeds too.
+ *
+ * Continuation frames live on the C stack and are chained through 'next',
+ * so matching still allocates nothing. Total work is bounded by
+ * MAX_MATCH_STEPS and stack depth by MAX_MATCH_DEPTH.
+ * ---------------------------------------------------------------------- */
+
+enum cont_kind { CONT_SEQ, CONT_REP };
+
+/* CONT_SEQ resumes a node run; CONT_REP closes one repetition of the group
+ * headed by 'p' (whose body ends at 'stop') and decides whether to repeat
+ * it again. */
+typedef struct re_cont {
+  const struct re_cont* next;
+  unsigned char kind;
+  regex_t* p;
+  regex_t* stop;
+  const char* iter;        /* CONT_REP: where this repetition began */
+  unsigned short min, max; /* CONT_REP: bounds; max == 0 is unbounded */
+  unsigned short done;     /* CONT_REP: repetitions completed */
+} re_cont;
+
+typedef struct {
+  const char* text_start; /* offset 0 for reported spans */
+  const char* anchor;     /* the only place '^' can match */
+  regex_t* prog_end;      /* the UNUSED sentinel */
+  re_match_result* out;
+  int has_branch; /* whether the pattern contains '\|' at all */
+} re_ctx;
+
+static const char* match_seq(regex_t* p,
+                             regex_t* stop,
+                             const char* text,
+                             const re_cont* k,
+                             re_ctx* ctx);
+static const char* match_cont(const re_cont* k, const char* text, re_ctx* ctx);
+static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx);
+static const char* match_group_iter(regex_t* g,
+                                    regex_t* gend,
+                                    const char* text,
+                                    unsigned short done,
+                                    unsigned short min,
+                                    unsigned short max,
+                                    const re_cont* k,
+                                    re_ctx* ctx);
+
+static unsigned short node_type(const regex_t* p) {
+  return p->type & ~RE_TYPE_ICASE;
+}
+
+static int isquantifier(unsigned short type) {
+  return type == QUESTIONMARK || type == STAR || type == PLUS ||
+         (unsigned)(type - TIMES) <= TIMES_NM - TIMES;
+}
+
+/* The GROUPEND closing the group headed by 'g'. Found by walking the
+ * nesting rather than by trusting GROUP's own 8-bit group_size, which a
+ * group of more than 255 nodes overflows. */
+static regex_t* group_end(regex_t* g, const re_ctx* ctx) {
+  regex_t* p = getnext(g);
+  int depth = 1;
+
+  while (p < ctx->prog_end) {
+    unsigned short type = node_type(p);
+    if (type == GROUP)
+      depth++;
+    else if (type == GROUPEND && --depth == 0)
+      break;
+    p = getnext(p);
   }
-  return count;
+  return p;
 }
 
-static int matchstar(regex_t* p,
-                     regex_t* pattern,
-                     const char* text,
-                     int* matchlength,
-                     const char* text_start,
-                     re_match_result* out) {
-  int num_patterns = 0;
-  re_span old_spans[RE_MAX_SPANS];
-  save_spans(old_spans, out);
-  if (matchplus(p, pattern, text, matchlength, text_start, out)) {
-    return 1;
+/* One past the atom starting at 'p', where a whole group is one atom. */
+static regex_t* atom_end(regex_t* p, regex_t* stop, const re_ctx* ctx) {
+  regex_t* end = node_type(p) == GROUP ? group_end(p, ctx) : p;
+
+  if (end >= ctx->prog_end)
+    return stop;
+  end = getnext(end);
+  return end < stop ? end : stop;
+}
+
+/* The first '\|' in [p, stop) that belongs to this level: alternation
+ * separates whole concatenations, so a BRANCH inside a nested group is
+ * that group's business, not ours. NULL when there is none. */
+static regex_t* find_branch(regex_t* p, regex_t* stop, const re_ctx* ctx) {
+  while (p < stop) {
+    if (node_type(p) == BRANCH)
+      return p;
+    p = atom_end(p, stop, ctx);
   }
-  restore_spans(out, old_spans);
-  if (matchpattern(pattern, text, matchlength, &num_patterns, text_start,
-                   out)) {
-    return 1;
-  }
-  restore_spans(out, old_spans);
-  return 0;
+  return NULL;
 }
 
-static int matchplus(regex_t* p,
-                     regex_t* pattern,
-                     const char* text,
-                     int* matchlength,
-                     const char* text_start,
-                     re_match_result* out) {
-  int num_patterns = 0;
-  const char* prepoint = text;
-  text += matchcount(p, text, UINT_MAX);
-
-  re_span old_spans[RE_MAX_SPANS];
-  save_spans(old_spans, out);
-
-  for (; text > prepoint; text--) {
-    if (matchpattern(pattern, text, matchlength, &num_patterns, text_start,
-                     out)) {
-      *matchlength += text - prepoint;
-      return 1;
-    }
-    restore_spans(out, old_spans);
-    DEBUG_P("+ pattern does not match %s\n", &text[1]);
-  }
-  DEBUG_P("+ pattern did not match %s\n", prepoint);
-  return 0;
-}
-
-static int matchquestion(regex_t* p,
-                         regex_t* pattern,
-                         const char* text,
-                         int* matchlength,
-                         const char* text_start,
-                         re_match_result* out) {
-  int num_patterns = 0;
-  if ((p->type & ~RE_TYPE_ICASE) == UNUSED)
-    return 1;
-
-  re_span old_spans[RE_MAX_SPANS];
-  save_spans(old_spans, out);
-
-  if (matchpattern(pattern, text, matchlength, &num_patterns, text_start,
-                   out)) {
-#ifdef DEBUG
-    DEBUG_P("? matched %s\n", text);
-#endif
-    return 1;
-  }
-  restore_spans(out, old_spans);
-  if (*text && matchone(p, *text++)) {
-    if (matchpattern(pattern, text, matchlength, &num_patterns, text_start,
-                     out)) {
-      (*matchlength)++;
-#ifdef DEBUG
-      DEBUG_P("? matched %s\n", text);
-#endif
-      return 1;
-    }
-  }
-  restore_spans(out, old_spans);
-  return 0;
-}
-
-static int matchtimes(regex_t* p,
-                      unsigned short n,
-                      const char* text,
-                      int* matchlength) {
-  unsigned count = matchcount(p, text, n);
-  if (count != n)
-    return 0;
-  *matchlength += count;
-  return 1;
-}
-
-static int matchtimes_n(regex_t* p,
-                        unsigned short n,
-                        const char* text,
-                        int* matchlength) {
-  unsigned count = matchcount(p, text, UINT_MAX);
-  if (count < n)
-    return 0;
-  *matchlength += count;
-  return 1;
-}
-
-static int matchtimes_m(regex_t* p,
-                        unsigned short m,
-                        const char* text,
-                        int* matchlength) {
-  *matchlength += matchcount(p, text, m);
-  return 1;
-}
-
-static int matchtimes_nm(regex_t* p,
-                         unsigned short n,
-                         unsigned short m,
-                         const char* text,
-                         int* matchlength) {
-  unsigned count = matchcount(p, text, m);
-  if (count < n)
-    return 0;
-  *matchlength += count;
-  return 1;
-}
-
-static int matchbranch(regex_t* p,
-                       regex_t* pattern,
-                       const char* text,
-                       int* matchlength,
-                       const char* text_start,
-                       re_match_result* out) {
-  int num_patterns = 0;
-  const char* prepoint = text;
-  if ((p->type & ~RE_TYPE_ICASE) == UNUSED)
-    return 1;
-
-  re_span old_spans[RE_MAX_SPANS];
-  save_spans(old_spans, out);
-
-  /* Match the current p (previous) */
-  if (*text && matchone(p, *text++)) {
-    (*matchlength)++;
-    return 1;
-  }
-  if ((pattern->type & ~RE_TYPE_ICASE) == UNUSED)
-    // empty branch "0|" allows NULL text
-    return 1;
-
-  restore_spans(out, old_spans);
-
-  /* or the next branch */
-  if (matchpattern(pattern, prepoint, matchlength, &num_patterns, text_start,
-                   out))
-    return 1;
-
-  restore_spans(out, old_spans);
-  return 0;
-}
-
-static int matchgroup(regex_t* p,
-                      const char* text,
-                      int* matchlength,
-                      const char* text_start,
-                      re_match_result* out) {
-  int pre = *matchlength;
-  int num_patterns = 0, length = pre;
-  regex_t* groupstart = p;
-  const regex_t* groupend =
-      getindex(p, p->u.group_size + 1);  //&p[p->u.group_size + 1];
-  DEBUG_P("does GROUP (%u) match %s?\n", (unsigned)p->u.group_size, text);
-
-  int g_num = p->u.group_num;
-  re_span old_spans[RE_MAX_SPANS];
-  save_spans(old_spans, out);
-  if (out) {
-    out->spans[g_num].start = text - text_start;
-  }
-
-  p = getnext(p);
-  while (p < groupend) {
-    if ((p->type & ~RE_TYPE_ICASE) ==
-        UNUSED)  // only with invalid external compiles
-      return 0;
-    regex_t* resume_from = p;
-    if (!matchpattern(p, text, &length, &num_patterns, text_start, out)) {
-      DEBUG_P("GROUP did not match %.*s (len %d, patterns %d)\n", length,
-              text - *matchlength, *matchlength, num_patterns);
-      *matchlength = pre;
-      restore_spans(out, old_spans);
-      return 0;
-    }
-    DEBUG_P("GROUP did match %.*s (len %d, patterns %d)\n", length,
-            text - *matchlength, *matchlength, num_patterns);
-    int delta = length - *matchlength;
-    text += delta;
-    p = getindex(groupstart, num_patterns);
-    *matchlength += delta;
-    /* matchquestion()/matchstar()/matchplus()/matchbranch() each recurse
-     * into matchpattern() with their own fresh, local "num_patterns" rather
-     * than this function's, so whenever the group's content resolves via
-     * one of those (any '*', '+', '?' or '|' inside the group), the above
-     * getindex() can fail to advance past "resume_from" -- re-matching the
-     * same node forever and blowing the stack. Stop instead: the group is
-     * considered fully matched at the length/text position reached so far. */
-    if (p <= resume_from)
+/* Repetition bounds of the quantifier node 'p'; max 0 means unbounded. */
+static void quant_bounds(const regex_t* p,
+                         unsigned short* min,
+                         unsigned short* max) {
+  switch (node_type(p)) {
+    case QUESTIONMARK:
+      *min = 0, *max = 1;
+      break;
+    case STAR:
+      *min = 0, *max = 0;
+      break;
+    case PLUS:
+      *min = 1, *max = 0;
+      break;
+    case TIMES:
+      *min = p->u.n, *max = p->u.n;
+      break;
+    case TIMES_N:
+      *min = p->u.n, *max = 0;
+      break;
+    case TIMES_M:
+      *min = 0, *max = p->u.m;
+      break;
+    default: /* TIMES_NM */
+      *min = p->u.n, *max = p->u.m;
       break;
   }
-  DEBUG_P("ENDGROUP did match %s (len %d, patterns %d)\n", text - *matchlength,
-          *matchlength, num_patterns);
-  if (out) {
-    out->spans[g_num].end = text - text_start;
-  }
-  return 1;
 }
 
-/* Match a quantified group, e.g. "(ab)+", "(ab){2,4}": greedily expand the
- * group up to 'max' times (0 = unbounded), recording the text position and
- * accumulated matchlength reached after each repetition, then backtrack
- * from the greediest count down to 'min' until 'pattern' (whatever follows
- * the quantifier) matches at that point. Mirrors matchplus()/matchtimes_n()
- * for a single atom, but repeats matchgroup() instead of matchone(). */
-static int matchgrouptimes(regex_t* p,
-                           regex_t* pattern,
-                           const char* text,
-                           int* matchlength,
-                           unsigned short min,
-                           unsigned short max,
-                           const char* text_start,
-                           re_match_result* out) {
-  const char* pos[MAX_GROUP_REPEATS + 1];
-  int cum[MAX_GROUP_REPEATS + 1];
-  re_span history[MAX_GROUP_REPEATS + 1][RE_MAX_SPANS];
-  int reps = 0;
-  const int base = *matchlength;
+/* The capture slot of group 'g', or NULL when it has none to record. */
+static re_span* group_span(const re_ctx* ctx, const regex_t* g) {
+  unsigned num = g->u.group_num;
 
-  pos[0] = text;
-  cum[0] = base;
-  save_spans(history[0], out);
-
-  while (reps < MAX_GROUP_REPEATS && (max == 0 || reps < max)) {
-    int ml = cum[reps];
-    restore_spans(out, history[reps]);
-    if (!matchgroup(p, pos[reps], &ml, text_start, out) || ml == cum[reps])
-      break;
-    reps++;
-    cum[reps] = ml;
-    pos[reps] = text + (ml - base);
-    save_spans(history[reps], out);
-  }
-
-  if (reps < min) {
-    *matchlength = base;
-    restore_spans(out, history[0]);
-    return 0;
-  }
-
-  for (int k = reps; k >= (int)min; k--) {
-    int trial_matchlength = cum[k];
-    int num_patterns = 0;
-    restore_spans(out, history[k]);
-    if (matchpattern(pattern, pos[k], &trial_matchlength, &num_patterns,
-                     text_start, out)) {
-      *matchlength = trial_matchlength;
-      return 1;
-    }
-  }
-
-  *matchlength = base;
-  restore_spans(out, history[0]);
-  return 0;
+  if (!ctx->out || num == 0 || num >= RE_MAX_SPANS)
+    return NULL;
+  return &ctx->out->spans[num];
 }
 
-static inline int ismultimatch(unsigned short type) {
-  type &= ~RE_TYPE_ICASE;
-  return (unsigned)(type - TIMES) <= TIMES_NM - TIMES;
+/* "a\|b": try the alternatives left to right, leftmost-first like Emacs.
+ * [p, br) is the first alternative and [br+1, stop) is everything after
+ * it, which recursion splits again at the next '\|'. */
+static const char* match_alt(regex_t* p,
+                             regex_t* br,
+                             regex_t* stop,
+                             const char* text,
+                             const re_cont* k,
+                             re_ctx* ctx) {
+  re_span saved[RE_MAX_SPANS];
+  const char* end;
+
+  save_spans(saved, ctx->out);
+  end = match_seq(p, br, text, k, ctx);
+  if (end)
+    return end;
+  restore_spans(ctx->out, saved);
+  end = match_seq(getnext(br), stop, text, k, ctx);
+  if (end)
+    return end;
+  restore_spans(ctx->out, saved);
+  return NULL;
 }
 
-/* Iterative matching */
-static int matchpattern(regex_t* pattern,
-                        const char* text,
-                        int* matchlength,
-                        int* num_patterns,
-                        const char* text_start,
-                        re_match_result* out) {
-  int pre = *matchlength;
+/* A quantified single-node atom. '*', '+' and the intervals are greedy:
+ * take as much as the atom allows, then hand bytes back one at a time
+ * until the rest of the pattern fits. '?' is non-greedy (see re.h) and
+ * grows instead of shrinking. */
+static const char* match_atom(regex_t* p,
+                              const char* text,
+                              unsigned short min,
+                              unsigned short max,
+                              int greedy,
+                              const re_cont* k,
+                              re_ctx* ctx) {
+  re_span saved[RE_MAX_SPANS];
+  unsigned n = 0;
+  unsigned i;
+
+  while ((max == 0 || n < max) && text[n] && matchone(p, text[n]))
+    n++;
+  if (n < min)
+    return NULL;
+
+  save_spans(saved, ctx->out);
+  for (i = min; i <= n; i++) {
+    const char* end = match_cont(k, text + (greedy ? min + n - i : i), ctx);
+    if (end)
+      return end;
+    restore_spans(ctx->out, saved);
+  }
+  return NULL;
+}
+
+/* '^' and '$' consume nothing, so a quantifier on one only decides
+ * whether the assertion has to hold at all. */
+static const char* match_anchor(const regex_t* p,
+                                const char* text,
+                                unsigned short min,
+                                const re_cont* k,
+                                re_ctx* ctx) {
+  int holds = node_type(p) == BEGIN ? text == ctx->anchor : text[0] == '\0';
+
+  if (!holds && min > 0)
+    return NULL;
+  return match_cont(k, text, ctx);
+}
+
+/* A group, quantified or not (an unquantified one is just min == max == 1).
+ * Greedy: entering the group is tried before skipping it. */
+static const char* match_group(regex_t* g,
+                               const char* text,
+                               unsigned short min,
+                               unsigned short max,
+                               const re_cont* k,
+                               re_ctx* ctx) {
+  re_span saved[RE_MAX_SPANS];
+  const char* end;
+
+  save_spans(saved, ctx->out);
+  end = match_group_iter(g, group_end(g, ctx), text, 0, min, max, k, ctx);
+  if (end)
+    return end;
+  restore_spans(ctx->out, saved);
+  if (min == 0)
+    return match_cont(k, text, ctx);
+  return NULL;
+}
+
+/* Start repetition number 'done' + 1 of the group headed by 'g'. */
+static const char* match_group_iter(regex_t* g,
+                                    regex_t* gend,
+                                    const char* text,
+                                    unsigned short done,
+                                    unsigned short min,
+                                    unsigned short max,
+                                    const re_cont* k,
+                                    re_ctx* ctx) {
+  re_span* span = group_span(ctx, g);
+  re_cont rep;
+
+  if (done >= MAX_GROUP_REPEATS)
+    return NULL;
+  if (span)
+    span->start = (int)(text - ctx->text_start);
+
+  rep.next = k;
+  rep.kind = CONT_REP;
+  rep.p = g;
+  rep.stop = gend;
+  rep.iter = text;
+  rep.min = min;
+  rep.max = max;
+  rep.done = done;
+  return match_seq(getnext(g), gend, text, &rep, ctx);
+}
+
+/* One repetition of a group finished at 'text': close its capture, then
+ * prefer repeating the group over leaving it. */
+static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
+  re_span* span = group_span(ctx, k->p);
+  unsigned short done = (unsigned short)(k->done + 1);
+  int grew = text != k->iter;
+
+  if (span)
+    span->end = (int)(text - ctx->text_start);
+
+  if (grew && (k->max == 0 || done < k->max)) {
+    re_span saved[RE_MAX_SPANS];
+    const char* end;
+    save_spans(saved, ctx->out);
+    end = match_group_iter(k->p, k->stop, text, done, k->min, k->max, k->next,
+                           ctx);
+    if (end)
+      return end;
+    restore_spans(ctx->out, saved);
+  }
+  /* A repetition that consumed nothing gets no further by repeating, so
+   * an empty body satisfies whatever is left of 'min'. */
+  if (done >= k->min || !grew)
+    return match_cont(k->next, text, ctx);
+  return NULL;
+}
+
+static const char* match_cont(const re_cont* k, const char* text, re_ctx* ctx) {
+  if (!k)
+    return text;
+  if (k->kind == CONT_SEQ)
+    return match_seq(k->p, k->stop, text, k->next, ctx);
+  return match_rep(k, text, ctx);
+}
+
+/* Match the node run [p, stop) at 'text', then the continuation 'k'. */
+static const char* match_seq_body(regex_t* p,
+                                  regex_t* stop,
+                                  const char* text,
+                                  const re_cont* k,
+                                  re_ctx* ctx) {
+  unsigned short type, min = 1, max = 1;
+  regex_t* after;
+  re_cont rest;
+  int greedy = 1;
+
+  if (p >= stop || node_type(p) == UNUSED)
+    return match_cont(k, text, ctx);
+
+  if (ctx->has_branch) {
+    regex_t* br = find_branch(p, stop, ctx);
+    if (br)
+      return match_alt(p, br, stop, text, k, ctx);
+  }
+
+  after = atom_end(p, stop, ctx);
+  if (after < stop && isquantifier(node_type(after))) {
+    quant_bounds(after, &min, &max);
+    /* '?' is documented non-greedy for a plain atom; on a group it has
+     * always been greedy here. D-1 will settle both on greedy. */
+    greedy = node_type(after) != QUESTIONMARK || node_type(p) == GROUP;
+    after = atom_end(after, stop, ctx);
+  }
+
+  rest.next = k;
+  rest.kind = CONT_SEQ;
+  rest.p = after;
+  rest.stop = stop;
+
+  type = node_type(p);
+  if (type == GROUP)
+    return match_group(p, text, min, max, &rest, ctx);
+  if (type == BEGIN || type == END)
+    return match_anchor(p, text, min, &rest, ctx);
+  if (isquantifier(type))
+    return NULL; /* a stray quantifier, e.g. "a*?", matches nothing */
+  return match_atom(p, text, min, max, greedy, &rest, ctx);
+}
+
+static const char* match_seq(regex_t* p,
+                             regex_t* stop,
+                             const char* text,
+                             const re_cont* k,
+                             re_ctx* ctx) {
+  const char* end;
+
   if (++re_match_steps > MAX_MATCH_STEPS)
-    return 0;
-  while (1) {
-    if ((pattern->type & ~RE_TYPE_ICASE) == UNUSED) {
-      return 1;
-    }
-
-    regex_t* next_pattern = getnext(pattern);
-
-    /* GROUPEND always terminates the current pattern chain, even when a
-     * quantifier for the enclosing group follows it. Checking this before
-     * the next_pattern-based quantifier lookaheads keeps matchgroup()'s
-     * internal matchpattern() call (matching the group's own contents)
-     * from reading past its own GROUPEND and mistaking the group's own
-     * quantifier for one that applies to the group's last inner atom. */
-    if ((pattern->type & ~RE_TYPE_ICASE) == GROUPEND) {
-      (*num_patterns)++;
-      DEBUG_P("GROUPEND matches %.*s (len %d, patterns %d)\n", *matchlength,
-              text - *matchlength, *matchlength, *num_patterns);
-      return 1;
-    } else if ((next_pattern->type & ~RE_TYPE_ICASE) == QUESTIONMARK) {
-      return matchquestion(pattern, getnext(next_pattern), text, matchlength,
-                           text_start, out);
-    } else if ((next_pattern->type & ~RE_TYPE_ICASE) == STAR) {
-      // int i = (pattern[1].type == GROUPEND) ? pattern[1].u.group_start : 0;
-      return matchstar(pattern, getnext(next_pattern), text, matchlength,
-                       text_start, out);
-    } else if ((next_pattern->type & ~RE_TYPE_ICASE) == PLUS) {
-      DEBUG_P("PLUS match %s?\n", text);
-      // int i = (pattern[1].type == GROUPEND) ? pattern[1].u.group_start : 0;
-      return matchplus(pattern, getnext(next_pattern), text, matchlength,
-                       text_start, out);
-    } else if (ismultimatch(next_pattern->type)) {
-      const int beforelen = *matchlength;
-      int retval = 0;
-      if ((next_pattern->type & ~RE_TYPE_ICASE) == TIMES) {
-        // int i = (pattern[1].type == GROUPEND) ? pattern[1].u.group_start : 0;
-        retval = matchtimes(pattern, next_pattern->u.n, text, matchlength);
-      } else if ((next_pattern->type & ~RE_TYPE_ICASE) == TIMES_N) {
-        retval = matchtimes_n(pattern, next_pattern->u.n, text, matchlength);
-      } else if ((next_pattern->type & ~RE_TYPE_ICASE) == TIMES_M) {
-        retval = matchtimes_m(pattern, next_pattern->u.m, text, matchlength);
-      } else if ((next_pattern->type & ~RE_TYPE_ICASE) == TIMES_NM) {
-        // int i = (pattern[1].type == GROUPEND) ? pattern[1].u.group_start : 0;
-        retval = matchtimes_nm(pattern, next_pattern->u.n, next_pattern->u.m,
-                               text, matchlength);
-      }
-
-      if (!retval)
-        return 0;
-      else {
-        const int consumed = *matchlength - beforelen;
-        pre = *matchlength;
-        (*num_patterns)++;
-        pattern = getnext(next_pattern);
-        text += consumed;
-        continue;
-      }
-
-    } else if ((next_pattern->type & ~RE_TYPE_ICASE) == BRANCH) {
-      // int i = (pattern[1].type == GROUPEND) ? pattern[1].u.group_start : 0;
-      return matchbranch(pattern, getnext(next_pattern), text, matchlength,
-                         text_start, out);
-    } else if ((pattern->type & ~RE_TYPE_ICASE) == GROUP) {
-      /* A quantifier following a group applies to the whole group, but it
-       * sits after GROUPEND -- outside the span "next_pattern" (the node
-       * right after the GROUP header) can see -- so it isn't caught by the
-       * QUESTIONMARK/STAR/PLUS/ismultimatch checks above. */
-      regex_t* after_group = getindex(pattern, pattern->u.group_size + 2);
-      unsigned short qmin = 0, qmax = 0;
-      int quantified = 1;
-      switch (after_group->type & ~RE_TYPE_ICASE) {
-        case QUESTIONMARK:
-          qmin = 0;
-          qmax = 1;
-          break;
-        case STAR:
-          qmin = 0;
-          qmax = 0;
-          break;
-        case PLUS:
-          qmin = 1;
-          qmax = 0;
-          break;
-        case TIMES:
-          qmin = after_group->u.n;
-          qmax = after_group->u.n;
-          break;
-        case TIMES_N:
-          qmin = after_group->u.n;
-          qmax = 0;
-          break;
-        case TIMES_M:
-          qmin = 0;
-          qmax = after_group->u.m;
-          break;
-        case TIMES_NM:
-          qmin = after_group->u.n;
-          qmax = after_group->u.m;
-          break;
-        default:
-          quantified = 0;
-          break;
-      }
-
-      if (quantified)
-        return matchgrouptimes(pattern, getnext(after_group), text, matchlength,
-                               qmin, qmax, text_start, out);
-
-      const int beforelen = *matchlength;
-      const int retval =
-          matchgroup(pattern, text, matchlength, text_start, out);
-
-      if (!retval)
-        return 0;
-      else {
-        text += (*matchlength - beforelen);
-        pre = *matchlength;
-        (*num_patterns) += pattern->u.group_size + 2;
-        pattern = getindex(pattern, pattern->u.group_size + 2);
-        continue;
-      }
-    } else if (((pattern->type & ~RE_TYPE_ICASE) == END) &&
-               (next_pattern->type & ~RE_TYPE_ICASE) == UNUSED) {
-      return (text[0] == '\0');
-    }
-    (*matchlength)++;
-    (*num_patterns)++;
-
-    if (text[0] == '\0')
-      break;
-    if (!matchone(pattern, *(text++)))
-      break;
-    pattern = next_pattern;
+    return NULL;
+  if (++re_match_depth > MAX_MATCH_DEPTH) {
+    /* Out of stack budget. Spend the step budget too, so the attempt
+     * unwinds at once and re_exec() reports it as TOO_COMPLEX. */
+    re_match_steps = MAX_MATCH_STEPS + 1;
+    re_match_depth--;
+    return NULL;
   }
+  end = match_seq_body(p, stop, text, k, ctx);
+  re_match_depth--;
+  return end;
+}
 
-  *matchlength = pre;
-  return 0;
+static void init_ctx(re_ctx* ctx,
+                     re_t pattern,
+                     const char* text,
+                     const char* text_start,
+                     re_match_result* out) {
+  regex_t* p = pattern;
+
+  ctx->text_start = text_start;
+  ctx->anchor = text;
+  ctx->out = out;
+  ctx->has_branch = 0;
+  while (node_type(p) != UNUSED) {
+    if (node_type(p) == BRANCH)
+      ctx->has_branch = 1;
+    p = getnext(p);
+  }
+  ctx->prog_end = p;
+}
+
+static int re_matchp_internal(re_t pattern,
+                              const char* text,
+                              int* matchlength,
+                              const char* text_start,
+                              re_match_result* out) {
+  re_ctx ctx;
+  int anchored;
+  int idx = 0;
+
+  re_match_steps = 0;
+  re_match_depth = 0;
+  *matchlength = 0;
+  if (!pattern)
+    return -1;
+
+  init_ctx(&ctx, pattern, text, text_start, out);
+  /* A leading '^' can only hold where the scan started, so trying later
+   * offsets is pointless -- unless a '\|' means the anchor governs the
+   * first alternative alone. */
+  anchored = node_type(pattern) == BEGIN && !ctx.has_branch;
+
+  do {
+    const char* end;
+    reset_spans(out);
+    end = match_seq(pattern, ctx.prog_end, text + idx, NULL, &ctx);
+    if (end) {
+      *matchlength = (int)(end - (text + idx));
+      return idx;
+    }
+    if (anchored)
+      break;
+  } while (text[idx++] != '\0');
+
+  return -1;
 }
 
 #ifdef CPROVER

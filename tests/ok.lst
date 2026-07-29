@@ -79,4 +79,32 @@ x{-2}			"x{-2}"		5
 ab\{2\}c		"abbc"		4
 \([a-z][0-9]\)+		"a0b1"		4
 \([a-z][0-9]\)\{3\}		"a0b1c2"	6
-#\(\(ab\)\|b\)+		"abbb"	        4
+\(\(ab\)\|b\)+		"abbb"	        4
+# Regression: the reported match used to end past the end of the subject
+# (a length was accumulated on failing backtracking paths and not undone).
+a*.c+			"ac"		2
+\(.*.a\{2\}\)		"baa"		3
+[a-c]+\w\{2\}b		"baab"		4
+\w*.\{3\}a?[a-c]\{1\}	"b11bZZZ"	4
+# Regression: "\|" separates whole alternatives, not just the atom before it.
+foo\|bar		"bar"		3
+foo\|bar		"foo"		3
+ab\|cd			"cd"		2
+abc\|abd		"abd"		3
+za\|b			"zb"		1
+\(ab\)\|\(cd\)		"cd"		2
+\(a\)\|b		"b"		1
+x\(ab\|cd\)y		"xcdy"		4
+\(ab\|cd\)ef		"cdef"		4
+\(a\|ab\)c		"abc"		3
+# Regression: groups and intervals give input back when what follows needs it.
+^\(.*\),\(.*\)$		"a,b"		3
+.\{2,3\}c		"abc"		3
+a\{2,3\}a		"aaa"		3
+a\{2,\}a		"aaa"		3
+a\{,3\}a		"aaa"		3
+\(.*\)x		"yx"		2
+\(a*\)a		"aa"		2
+\(a+\)a		"aa"		2
+\(.+\)c		"bc"		2
+\(a\{2\}\)a		"aaa"		3

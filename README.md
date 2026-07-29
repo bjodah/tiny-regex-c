@@ -87,7 +87,7 @@ The following features / regex-operators are supported by this library.
   -  `\D`       Non-digits
   -  `\xXX`     Hex-encoded byte
   -  `[[:digit:]]` POSIX bracket classes inside character classes
-  -  `\|`       Branch Or, e.g. `a\|A`, `\w\|\s`
+  -  `\|`       Branch Or, e.g. `a\|A`, `ab\|cd`
   -  `\{n\}`    Exact quantifier
   -  `\{n,\}`   Match n or more times
   -  `\{,m\}`   Match m or less times
@@ -96,6 +96,12 @@ The following features / regex-operators are supported by this library.
 
 Bare `(`, `)`, `|`, `{`, and `}` are literal characters; grouping,
 alternation, and intervals use the escaped Emacs-style forms above.
+
+`\|` has the lowest precedence, as in Emacs: its alternatives are whole
+concatenations (`ab\|cd` is `ab` or `cd`, not `a` followed by `b\|cd`),
+bounded by the enclosing `\(...\)` if there is one. Quantified groups and
+intervals backtrack, so `\(.*\),\(.*\)` and `.\{2,3\}c` behave as they do
+in Emacs.
 
 ### Usage
 Compile a regex from ASCII-string (char-array) to a custom pattern structure using `re_compile()`.
@@ -131,7 +137,6 @@ if (match_idx != -1)
 For more usage examples I encourage you to look at the code in the `tests`-folder.
 
 ### TODO
-- Fix length with nested groups, e.g. `\(\(ab\)\|b\)+` =~ abbb => 7 not 4.
 - Add `example.c` that demonstrates usage.
 - Add `tests/test_perf.c` for performance and time measurements.
 - Add optional multibyte support (e.g. UTF-8). On non-wchar systems roll our own.

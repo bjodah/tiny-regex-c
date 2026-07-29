@@ -10,6 +10,70 @@
 
 #include "re.h"
 
+/* A pattern, a subject and the spans GNU Emacs reports for it.  nspans 0
+ * means "must not match"; a span of {-1, -1} is a group that did not
+ * participate. */
+struct span_case {
+  const char* pattern;
+  const char* text;
+  int nspans;
+  int spans[3][2];
+};
+
+/* Run one span_case and report how many checks it failed. */
+static int check_spans(const struct span_case* c) {
+  unsigned char storage[256];
+  unsigned size = sizeof(storage);
+  re_t regex = NULL;
+  re_match_result res;
+  re_status status;
+  int len = (int)strlen(c->text);
+  int failed = 0;
+  int i;
+
+  if (re_compile_checked(c->pattern, RE_FLAG_NONE, storage, &size, &regex) !=
+      RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: re_compile_checked(\"%s\") failed\n", c->pattern);
+    return 1;
+  }
+
+  status = re_exec(regex, c->text, 0, &res);
+  if (c->nspans == 0) {
+    if (status == RE_STATUS_OK)
+      fprintf(stderr, "FAIL: \"%s\" matched \"%s\" [%d, %d)\n", c->pattern,
+              c->text, res.spans[0].start, res.spans[0].end);
+    return status == RE_STATUS_OK;
+  }
+  if (status != RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: \"%s\" did not match \"%s\" (status %d)\n",
+            c->pattern, c->text, status);
+    return 1;
+  }
+  if (res.nspans != c->nspans) {
+    fprintf(stderr, "FAIL: \"%s\" on \"%s\": nspans %d, expected %d\n",
+            c->pattern, c->text, res.nspans, c->nspans);
+    failed++;
+  }
+  for (i = 0; i < c->nspans && i < res.nspans; i++) {
+    if (res.spans[i].start != c->spans[i][0] ||
+        res.spans[i].end != c->spans[i][1]) {
+      fprintf(stderr, "FAIL: \"%s\" on \"%s\": span %d [%d, %d), expected "
+                      "[%d, %d)\n",
+              c->pattern, c->text, i, res.spans[i].start, res.spans[i].end,
+              c->spans[i][0], c->spans[i][1]);
+      failed++;
+    }
+    /* The invariant behind all of this: a match lies inside its subject. */
+    if (res.spans[i].end > len) {
+      fprintf(stderr, "FAIL: \"%s\" on \"%s\": span %d ends at %d, past the "
+                      "%d-byte subject\n",
+              c->pattern, c->text, i, res.spans[i].end, len);
+      failed++;
+    }
+  }
+  return failed;
+}
+
 int main(void) {
   int failed = 0;
 
@@ -396,6 +460,42 @@ int main(void) {
           }
         }
       }
+    }
+
+    /* Test 11: spans, including capture spans, for the three defects this
+     * matcher was rebuilt around.  Every expectation is what GNU Emacs
+     * reports for the same pattern and subject. */
+    {
+      static const struct span_case cases[] = {
+          /* the reported end used to run past the end of the subject */
+          {"a*.c+", "ac", 1, {{0, 2}}},
+          {"\\(.*.a\\{2\\}\\)", "baa", 2, {{0, 3}, {0, 3}}},
+          {"[a-c]+\\w\\{2\\}b", "baab", 1, {{0, 4}}},
+          {"\\w*.\\{3\\}a?[a-c]\\{1\\}", "b11bZZZ", 1, {{0, 4}}},
+          /* "\|" separates whole alternatives, not just the atom before it */
+          {"foo\\|bar", "bar", 1, {{0, 3}}},
+          {"ab\\|cd", "cd", 1, {{0, 2}}},
+          {"za\\|b", "zb", 1, {{1, 2}}},
+          {"\\(ab\\)\\|\\(cd\\)", "cd", 3, {{0, 2}, {-1, -1}, {0, 2}}},
+          {"x\\(ab\\|cd\\)y", "xcdy", 2, {{0, 4}, {1, 3}}},
+          {"\\(a\\|ab\\)c", "abc", 2, {{0, 3}, {0, 2}}},
+          {"ab\\|cd", "ac", 0, {{0, 0}}},
+          /* groups and intervals give input back when what follows needs it */
+          {"^\\(.*\\),\\(.*\\)$", "a,b", 3, {{0, 3}, {0, 1}, {2, 3}}},
+          {".\\{2,3\\}c", "abc", 1, {{0, 3}}},
+          {"a\\{2,3\\}a", "aaa", 1, {{0, 3}}},
+          {"a\\{2,\\}a", "aaa", 1, {{0, 3}}},
+          {"a\\{,3\\}a", "aaa", 1, {{0, 3}}},
+          {"\\(.*\\)x", "yx", 2, {{0, 2}, {0, 1}}},
+          {"\\(a*\\)a", "aa", 2, {{0, 2}, {0, 1}}},
+          {"\\(a+\\)a", "aa", 2, {{0, 2}, {0, 1}}},
+          {"\\(a\\{2\\}\\)a", "aaa", 2, {{0, 3}, {0, 2}}},
+          {"\\(a\\{2\\}\\)a", "aa", 0, {{0, 0}}},
+          {"\\(.*\\)x", "y", 0, {{0, 0}}},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
     }
   }
 
