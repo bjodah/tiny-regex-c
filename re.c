@@ -50,14 +50,11 @@
 
 /* Definitions: */
 
-#define MAX_CHAR_CLASS_LEN 40 /* Max length of character-class buffer in. */
 #ifndef CPROVER
 #define MAX_REGEXP_OBJECTS 30 /* Max number of regex symbols in expression. */
 #else
 #define MAX_REGEXP_OBJECTS 8 /* faster formal proofs */
 #endif
-
-#define MAX_REGEXP_LEN 70
 
 /* Largest count a "\{n,m\}" interval may spell.  This is the value Emacs
  * accepts up to (its RE_DUP_MAX, a name <limits.h> also defines, hence the
