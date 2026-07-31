@@ -292,16 +292,65 @@ static re_t getnext(regex_t* pattern) {
   return (re_t)(((unsigned char*)pattern) + getsize(pattern));
 }
 
-static re_t getindex(regex_t* pattern, int index) {
-  /* UNUSED terminates the compiled buffer; it is always safely in-bounds,
-   * but stepping *from* it via getnext() is not. An index that overshoots
-   * the pattern -- re_compile_to()'s "\)" scan walks back over indices it
-   * has not finished writing -- would otherwise walk this past the end of
-   * the buffer; clamp to the sentinel instead. */
-  for (int i = 1; i <= index && (pattern->type & ~RE_TYPE_ICASE) != UNUSED; ++i)
-    pattern = getnext(pattern);
+/* ------------------------------------------------------------------------
+ * Compile-time emitter
+ *
+ * One cursor over the program being compiled: where the next node goes,
+ * and how many nodes precede it.  Those two facts used to live in separate
+ * variables, and the invalid-"\x" fallback advanced the byte cursor by up
+ * to three nodes while the count advanced by one.  Since the "\)" handler
+ * scans back over node *indices*, a later group was then misparsed:
+ * "\(a\)x\(b\)" compiled and "\(a\)\xZ\(b\)" was rejected.  One cursor
+ * cannot disagree with itself.
+ * ---------------------------------------------------------------------- */
 
-  return pattern;
+struct re_emitter {
+  unsigned char* base; /* the caller's buffer */
+  unsigned char* next; /* where the node under construction starts */
+  unsigned char* end;  /* one past the buffer */
+  unsigned nodes;      /* nodes already finished */
+};
+
+/* Room for one more whole node.  Spelled as an addition rather than
+ * "end - sizeof(regex_t)": with a caller buffer smaller than one node that
+ * subtraction underflows the unsigned size and the pointer arithmetic
+ * built on it is undefined. */
+static int emitter_room(const struct re_emitter* em) {
+  return em->next + sizeof(regex_t) < em->end;
+}
+
+/* The node under construction.  It joins the program at emitter_commit(),
+ * which reads its type to learn how wide it is. */
+static regex_t* emitter_node(const struct re_emitter* em) {
+  return (regex_t*)em->next;
+}
+
+static void emitter_commit(struct re_emitter* em) {
+  em->next += getsize(emitter_node(em));
+  em->nodes++;
+}
+
+/* The already-finished node at logical index 'index'. */
+static regex_t* emitter_node_at(const struct re_emitter* em, unsigned index) {
+  regex_t* p = (regex_t*)em->base;
+  unsigned n;
+
+  for (n = 0; n < index; n++)
+    p = getnext(p);
+  return p;
+}
+
+/* Emit one literal-character node, or fail for want of room. */
+static int emit_char(struct re_emitter* em, unsigned cp) {
+  regex_t* node;
+
+  if (!emitter_room(em))
+    return 0;
+  node = emitter_node(em);
+  node->type = CHAR;
+  set_char_cp(node, cp);
+  emitter_commit(em);
+  return 1;
 }
 
 /* Backtracking budget for the current top-level match attempt; both are
@@ -583,16 +632,44 @@ static int compile_interval(const char* s, const char* end, regex_t* node) {
   return 1;
 }
 
-/* Whether a quantifier written at node index 'j' has an atom to repeat.
- * At the start of the pattern, of a group or of an alternative, and after
- * an anchor, there is none, and Emacs reads "\{" there as a literal '{'. */
-static int quantifiable(unsigned char* re_data, int j) {
+/* Whether a quantifier written here has an atom to repeat.  At the start
+ * of the pattern, of a group or of an alternative, and after an anchor,
+ * there is none, and Emacs reads "\{" there as a literal '{'. */
+static int quantifiable(const struct re_emitter* em) {
   unsigned short type;
 
-  if (j <= 0)
+  if (em->nodes == 0)
     return 0;
-  type = getindex((regex_t*)re_data, j - 1)->type & ~RE_TYPE_ICASE;
+  type = emitter_node_at(em, em->nodes - 1)->type & ~RE_TYPE_ICASE;
   return type != GROUP && type != BRANCH && type != BEGIN && type != END;
+}
+
+/* The "\xXX" escape, *i on the 'x'.  A well-formed one is a single CHAR
+ * node holding the byte.  A malformed one is the literal characters it is
+ * spelled with -- '\', 'x' and whatever followed -- each its own CHAR node,
+ * which is the reading tests/ok.lst has recorded all along.  Leaves *i on
+ * the last pattern byte consumed; returns 0 only for want of room. */
+static int compile_hex_escape(const char* pattern,
+                              int* i,
+                              struct re_emitter* em) {
+  int hi = hex(pattern[*i + 1]);
+  int lo = hi < 0 ? -1 : hex(pattern[*i + 2]);
+
+  if (lo >= 0) {
+    *i += 2;
+    return emit_char(em, byte_cp((unsigned char)((hi << 4) + lo)));
+  }
+  if (!emit_char(em, '\\') || !emit_char(em, 'x'))
+    return 0;
+  if (!pattern[*i + 1])
+    return 1;
+  *i += 1;
+  if (!emit_char(em, byte_cp((unsigned char)pattern[*i])))
+    return 0;
+  if (hi < 0 || !pattern[*i + 1])
+    return 1;
+  *i += 1;
+  return emit_char(em, byte_cp((unsigned char)pattern[*i]));
 }
 
 re_t re_compile_to(const char* pattern,
@@ -602,27 +679,22 @@ re_t re_compile_to(const char* pattern,
     return 0;
   memset(re_data, 0, *size);
 
-  int i = 0; /* index into pattern        */
-  int j = 0; /* index into re_data    */
+  int i = 0; /* index into pattern */
   int num_groups = 0;
   unsigned bytes = *size;
   *size = 0;
 
-  regex_t* re_compiled = (regex_t*)(re_data);
-
-  /* "< re_data + bytes" (rather than "re_data + bytes - sizeof(regex_t)")
-   * avoids computing bytes - sizeof(regex_t): with a caller-supplied buffer
-   * smaller than sizeof(regex_t), that subtraction underflows the unsigned
-   * "bytes" and the resulting pointer addition is undefined behavior. */
-#define RE_HAS_ROOM(p) ((char*)(p) + sizeof(regex_t) < (char*)re_data + bytes)
+  struct re_emitter em = {re_data, re_data, re_data + bytes, 0};
+  regex_t* re_compiled;
 
   /* Bound the scan by the pattern length rather than re-reading past the
    * terminator: some escape handlers (e.g. '\x') land `i` on the NUL and
    * the trailing `i += 1` then steps one byte past the allocation. */
   const int plen = pattern ? (int)strlen(pattern) : 0;
-  while (i < plen && RE_HAS_ROOM(re_compiled)) {
+  while (i < plen && emitter_room(&em)) {
     char c = pattern[i];
 
+    re_compiled = emitter_node(&em);
     switch (c) {
       /* Meta-characters: */
       case '^': {
@@ -635,22 +707,19 @@ re_t re_compile_to(const char* pattern,
         re_compiled->type = DOT;
       } break;
       case '*': {
-        if (j > 0)
-          re_compiled->type = STAR;
-        else  // nothing to repeat at position 0
+        if (em.nodes == 0)  // nothing to repeat at position 0
           return 0;
+        re_compiled->type = STAR;
       } break;
       case '+': {
-        if (j > 0)
-          re_compiled->type = PLUS;
-        else  // nothing to repeat at position 0
+        if (em.nodes == 0)  // nothing to repeat at position 0
           return 0;
+        re_compiled->type = PLUS;
       } break;
       case '?': {
-        if (j > 0)
-          re_compiled->type = QUESTIONMARK;
-        else  // nothing to repeat at position 0
+        if (em.nodes == 0)  // nothing to repeat at position 0
           return 0;
+        re_compiled->type = QUESTIONMARK;
       } break;
 
       /* Escaped character-classes (\s \S \w \W \d \D \*): */
@@ -710,16 +779,16 @@ re_t re_compile_to(const char* pattern,
             } break;
             case ')': {
               int nestlevel = 0;
-              int k = j - 1;
+              int k = (int)em.nodes - 1;
               for (; k >= 0; k--) {
-                regex_t* cur = getindex((regex_t*)re_data, k);
-                if (k < j && (cur->type & ~RE_TYPE_ICASE) == GROUPEND)
+                regex_t* cur = emitter_node_at(&em, (unsigned)k);
+                if ((cur->type & ~RE_TYPE_ICASE) == GROUPEND)
                   nestlevel++;
                 else if ((cur->type & ~RE_TYPE_ICASE) == GROUP) {
                   if (nestlevel == 0) {
-                    cur->u.group_size = j - k - 1;
+                    cur->u.group_size = (unsigned char)(em.nodes - k - 1);
                     re_compiled->type = GROUPEND;
-                    re_compiled->u.group_start = k;
+                    re_compiled->u.group_start = (unsigned char)k;
                     re_compiled->u.group_num_end = cur->u.group_num;
                     break;
                   }
@@ -743,7 +812,7 @@ re_t re_compile_to(const char* pattern,
                 p++;
               if (*p == '\0')
                 return 0;
-              if (!quantifiable(re_data, j)) {
+              if (!quantifiable(&em)) {
                 re_compiled->type = CHAR;
                 set_char_cp(re_compiled, '{');
                 break;
@@ -753,60 +822,13 @@ re_t re_compile_to(const char* pattern,
               i = (p - pattern) + 1;
             } break;
             case 'x': {
-              /* \xXX. An invalid escape here falls back to emitting the
-               * literal characters seen so far as separate CHAR nodes,
-               * bypassing the main loop's own per-iteration bounds check
-               * -- each extra node needs its own RE_HAS_ROOM() check. */
-              re_compiled->type = CHAR;
-              i++;
-              int h = hex(pattern[i]);
-              if (h == -1) {
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled, '\\');
-
-                re_compiled = getnext(re_compiled);
-                if (!RE_HAS_ROOM(re_compiled))
-                  return 0;
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled, 'x');
-
-                re_compiled = getnext(re_compiled);
-                if (!RE_HAS_ROOM(re_compiled))
-                  return 0;
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled, byte_cp((unsigned char)pattern[i]));
-                break;
-              }
-              int byte = h << 4;
-              h = hex(pattern[++i]);
-              if (h != -1)
-                set_char_cp(re_compiled, byte_cp((unsigned char)(byte + h)));
-              else {
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled, '\\');
-
-                re_compiled = getnext(re_compiled);
-                if (!RE_HAS_ROOM(re_compiled))
-                  return 0;
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled, 'x');
-
-                re_compiled = getnext(re_compiled);
-                if (!RE_HAS_ROOM(re_compiled))
-                  return 0;
-                re_compiled->type = CHAR;
-                set_char_cp(re_compiled,
-                            byte_cp((unsigned char)pattern[i - 1]));
-
-                if (pattern[i]) {
-                  re_compiled = getnext(re_compiled);
-                  if (!RE_HAS_ROOM(re_compiled))
-                    return 0;
-                  re_compiled->type = CHAR;
-                  set_char_cp(re_compiled, byte_cp((unsigned char)pattern[i]));
-                }
-              }
-            } break;
+              /* Emits its own nodes -- one, or the three or four of the
+               * malformed spelling -- so the loop must not commit again. */
+              if (!compile_hex_escape(pattern, &i, &em))
+                return 0;
+              i += 1;
+              continue;
+            }
 
             /* Escaped character, e.g. '.', '$' or '\\' */
             default: {
@@ -825,8 +847,7 @@ re_t re_compile_to(const char* pattern,
 
       /* Character class: */
       case '[': {
-        if (!compile_charclass(pattern, &i, re_compiled,
-                               (char*)re_data + bytes))
+        if (!compile_charclass(pattern, &i, re_compiled, (char*)em.end))
           return 0;
       } break;
 
@@ -843,23 +864,26 @@ re_t re_compile_to(const char* pattern,
       } break;
     }
     i += 1;
-    j += 1;
-    re_compiled = getnext(re_compiled);
+    emitter_commit(&em);
   }
-  /* 'UNUSED' is a sentinel used to indicate end-of-pattern. The main loop's
-   * bounds check only guarantees room for a full regex_t before *starting*
-   * an iteration; if it instead exits because the buffer ran out (rather
-   * than because the pattern did), "re_compiled" can already sit within
-   * sizeof(unsigned short) of the buffer end, and writing the sentinel's
-   * type field here would overflow a small caller-supplied buffer. */
-  if ((char*)re_compiled + sizeof(unsigned short) > (char*)re_data + bytes)
+  /* The loop also stops when the buffer runs out. Compiling a prefix of
+   * the pattern and calling that a success is worse than failing: the
+   * caller gets a regex that quietly means something else. */
+  if (i < plen)
     return 0;
+  /* 'UNUSED' is a sentinel used to indicate end-of-pattern. The loop's
+   * bounds check only guarantees room for a full regex_t before *starting*
+   * an iteration, and a character class is as wide as its contents, so the
+   * emitter can sit within sizeof(unsigned short) of the buffer end here
+   * and writing the sentinel's type field would overflow the buffer. */
+  if ((char*)em.next + sizeof(unsigned short) > (char*)em.end)
+    return 0;
+  re_compiled = emitter_node(&em);
   re_compiled->type = UNUSED;
 
   /* Calculate final, compressed actual size. */
-  *size = (unsigned char*)getnext(re_compiled) - re_data;
+  *size = (unsigned)((unsigned char*)getnext(re_compiled) - em.base);
 
-#undef RE_HAS_ROOM
   return (re_t)re_data;
 }
 

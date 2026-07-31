@@ -85,7 +85,9 @@ The following features / regex-operators are supported by this library.
   -  `\W`       Non-alphanumeric
   -  `\d`       Digits, [0-9]
   -  `\D`       Non-digits
-  -  `\xXX`     Hex-encoded byte
+  -  `\xXX`     Hex-encoded byte. Without two hex digits it is not an
+     escape at all: `\xZ` is the three literal characters it is spelled
+     with, `\x4X` the four, and a trailing `\x` the two
   -  `[[:digit:]]` POSIX bracket classes inside character classes: alnum,
      alpha, ascii, blank, cntrl, digit, graph, lower, nonascii, print, punct,
      space, upper, word, xdigit
@@ -159,7 +161,12 @@ aligned is **refused** rather than written to and read back through:
 Passing `NULL` storage with `*storage_size == 0` to
 `re_compile_checked()` is the supported way to ask how many bytes the
 pattern needs; it reports `RE_STATUS_BUFFER_TOO_SMALL` and writes the
-required size.
+required size, and compiling into exactly that many bytes then works.
+
+A buffer too small for the whole pattern is a failure, never a silently
+compiled prefix. `re_compile_to()` writes straight into the caller's
+buffer and wants one node's slack over the size it reports; callers that
+must fit exactly should go through `re_compile_checked()`.
 
 ### Usage
 Compile a regex from ASCII-string (char-array) to a custom pattern structure using `re_compile()`.

@@ -28,7 +28,11 @@
  *              complements -- as one whole character)
  *   '\xXX'     Hex-encoded byte; a non-ASCII one is a byte that stands
  *              alone, so it matches only where the subject has no valid
- *              sequence around it
+ *              sequence around it.  Where the two hex digits are not
+ *              there, the escape is not one: '\xZ' is the three literal
+ *              characters '\', 'x' and 'Z', '\x4X' the four it is spelled
+ *              with, and a trailing '\x' the two.  A quantifier after
+ *              such a spelling therefore repeats its last character.
  *   '\|'       Branch Or; the alternatives are whole concatenations and
  *              a group bounds them, e.g. ab\|cd, x\(ab\|cd\)y
  *   '\{n\}'    Match n times
@@ -146,7 +150,11 @@ re_status re_exec(re_t regex,
 
 /* Compile regex string pattern to custom buffer, returning # of bytes used.
  * `re_data` must be aligned to RE_STORAGE_ALIGNMENT; a buffer that is not is
- * rejected (NULL return) rather than written to. */
+ * rejected (NULL return) rather than written to.  A buffer too small for the
+ * whole pattern is also a NULL return -- never a silently compiled prefix of
+ * it -- and this entry point wants one node's slack over the size it ends up
+ * reporting, so a caller that must fit exactly should compile through
+ * re_compile_checked(), which reports the size it needs and needs no more. */
 re_t re_compile_to(const char* pattern,
                    unsigned char* re_data,
                    unsigned* bytes);

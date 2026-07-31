@@ -616,6 +616,24 @@ int main(void) {
           {"\\xc3", "\xc3", 1, {{0, 1}}, 0},
           {"\\xc3", "\xc3\xa5", 0, {{0, 0}}, 0},
           {"\\x61", "a", 1, {{0, 1}}, 0},
+          /* A "\x" that is not a hex escape after all is the literal
+           * characters it is spelled with -- three nodes, or four.  The
+           * compiler used to count that as one node, so anything after it
+           * that scans back over node indices (a group's "\)") landed in
+           * the middle of the program. */
+          {"\\xZ", "\\xZ", 1, {{0, 3}}, 0},
+          {"\\x4", "\\x4", 1, {{0, 3}}, 0},
+          {"\\x4X", "\\x4X", 1, {{0, 4}}, 0},
+          {"\\x", "\\x", 1, {{0, 2}}, 0},
+          {"\\xZ\\xY", "\\xZ\\xY", 1, {{0, 6}}, 0},
+          /* before, inside and after a group, and nested */
+          {"\\xZ\\(a\\)", "\\xZa", 2, {{0, 4}, {3, 4}}, 0},
+          {"\\(\\xZ\\)a", "\\xZa", 2, {{0, 4}, {0, 3}}, 0},
+          {"\\(a\\)\\xZ\\(b\\)", "a\\xZb", 3, {{0, 5}, {0, 1}, {4, 5}}, 0},
+          {"\\(\\(a\\)\\xZ\\)b", "a\\xZb", 3, {{0, 5}, {0, 4}, {0, 1}}, 0},
+          /* an interval after the fallback repeats its *last* node */
+          {"\\xZ\\{2\\}", "\\xZZ", 1, {{0, 4}}, 0},
+          {"\\xZ\\{2\\}", "\\xZ", 0, {{0, 0}}, 0},
       };
       size_t i;
       for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
@@ -790,6 +808,96 @@ int main(void) {
                   "FAIL: compiling into the queried size returned %d (%u vs "
                   "%u)\n",
                   status, exact_size, query_size);
+          failed++;
+        }
+      }
+    }
+
+    /* Test 15: the storage boundary, swept one byte at a time.
+     *
+     * "\xZ" is the interesting pattern: its fallback emits three nodes
+     * from a single loop iteration, and those extra nodes used to sidestep
+     * the loop's own bounds check.  For every capacity the invariants are:
+     * nothing is written at or past the caller's limit; a compile that
+     * succeeds compiled the *whole* pattern, never a prefix of it, and so
+     * reports the same size and the same spans as a roomy one; and no
+     * capacity below the reported size can succeed.  re_compile_to() wants
+     * one node's slack over that size, which is why the sweep runs past
+     * it (re_compile_checked() has no such slack -- it compiles into its
+     * own buffer and copies the exact bytes out). */
+    {
+      static const char* const pats[] = {"\\xZ", "\\x4X", "\\(a\\)\\xZ\\(b\\)",
+                                         "a[0-9]+", "[[:digit:]]\\{2,4\\}"};
+      size_t pi;
+
+      for (pi = 0; pi < sizeof(pats) / sizeof(*pats); pi++) {
+        const char* pat = pats[pi];
+        unsigned need = 0;
+        re_t sized = NULL;
+        unsigned cap;
+        int accepted = 0;
+
+        if (re_compile_checked(pat, RE_FLAG_NONE, NULL, &need, &sized) !=
+                RE_STATUS_BUFFER_TOO_SMALL ||
+            need == 0 || need > 64) {
+          fprintf(stderr, "FAIL: size query for \"%s\" gave %u\n", pat, need);
+          failed++;
+          continue;
+        }
+        /* The size the query reports is enough for re_compile_checked. */
+        {
+          _Alignas(RE_STORAGE_ALIGNMENT) unsigned char exact[64];
+          unsigned exact_size = need;
+          re_t exact_regex = NULL;
+          if (re_compile_checked(pat, RE_FLAG_NONE, exact, &exact_size,
+                                 &exact_regex) != RE_STATUS_OK) {
+            fprintf(stderr,
+                    "FAIL: re_compile_checked(\"%s\") into its own reported "
+                    "%u bytes failed\n",
+                    pat, need);
+            failed++;
+          }
+        }
+
+        for (cap = 1; cap <= need + sizeof(void*) * 2; cap++) {
+          _Alignas(RE_STORAGE_ALIGNMENT) unsigned char buf[128];
+          unsigned sz = cap;
+          re_t got;
+          unsigned k;
+
+          memset(buf, 0xAA, sizeof(buf));
+          got = re_compile_to(pat, buf, &sz);
+          if (got && cap < need) {
+            fprintf(stderr,
+                    "FAIL: re_compile_to(\"%s\") compiled into %u bytes, "
+                    "under the %u it needs\n",
+                    pat, cap, need);
+            failed++;
+          }
+          if (got && sz != need) {
+            fprintf(stderr,
+                    "FAIL: re_compile_to(\"%s\") into %u bytes reported size "
+                    "%u, expected %u -- a prefix of the pattern?\n",
+                    pat, cap, sz, need);
+            failed++;
+          }
+          accepted += (got != NULL);
+          for (k = cap; k < sizeof(buf); k++) {
+            if (buf[k] != 0xAA) {
+              fprintf(stderr,
+                      "FAIL: re_compile_to(\"%s\") into %u bytes wrote past "
+                      "the buffer, at offset %u\n",
+                      pat, cap, k);
+              failed++;
+              break;
+            }
+          }
+        }
+        if (!accepted) {
+          fprintf(stderr,
+                  "FAIL: re_compile_to(\"%s\") never compiled, even with "
+                  "slack over its %u bytes\n",
+                  pat, need);
           failed++;
         }
       }

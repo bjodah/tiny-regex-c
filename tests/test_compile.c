@@ -12,21 +12,47 @@ And some structural issues with nested groups.
 #include <stdlib.h> /* for NULL */
 #include "re.h"
 
-typedef struct regex_t
+/* Compile 'pattern', run it over 'text', and compare the first 'nspans'
+ * reported spans with 'spans'. Returns the number of checks that failed. */
+static int check_spans(const char *pattern, const char *text,
+                       int nspans, const int spans[][2])
 {
-  unsigned type;     /* CHAR, STAR, etc.                      */
-  union
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[512];
+  unsigned size = sizeof(storage);
+  re_t regex = NULL;
+  re_match_result res;
+  int failed = 0;
+  int i;
+
+  if (re_compile_checked(pattern, RE_FLAG_NONE, storage, &size, &regex)
+      != RE_STATUS_OK)
   {
-    char  ch;            /*      the character itself             */
-    char* ccl;           /*  OR  a pointer to characters in class */
-    unsigned char  group_num;   /*  OR the number of group patterns. */
-    unsigned char  group_start; /*  OR for GROUPEND, the start index of the group. */
-    struct {
-      unsigned short n;  /* match n times */
-      unsigned short m;  /* match n to m times */
-    };
-  } u;
-} regex_t;
+    printf(" re_compile_checked(\"%s\") failed.\n", pattern);
+    return 1;
+  }
+  if (re_exec(regex, text, 0, &res) != RE_STATUS_OK)
+  {
+    printf(" \"%s\" did not match \"%s\".\n", pattern, text);
+    return 1;
+  }
+  if (res.nspans != nspans)
+  {
+    printf(" \"%s\" on \"%s\": nspans %d, expected %d.\n",
+           pattern, text, res.nspans, nspans);
+    failed++;
+  }
+  for (i = 0; i < nspans && i < res.nspans; i++)
+  {
+    if (res.spans[i].start != spans[i][0] || res.spans[i].end != spans[i][1])
+    {
+      printf(" \"%s\" on \"%s\": span %d [%d, %d), expected [%d, %d).\n",
+             pattern, text, i, res.spans[i].start, res.spans[i].end,
+             spans[i][0], spans[i][1]);
+      failed++;
+    }
+  }
+  return failed;
+}
 
 int main(void)
 {
@@ -72,7 +98,7 @@ int main(void)
   for (i = 0; i < ntests_invalid; i++)
   {
     const char *s = tests[i];
-    regex_t *p = re_compile(s);
+    re_t p = re_compile(s);
     int compiled = (p != NULL);
     ntests++;
     if (xfail_invalid[i])
@@ -92,36 +118,27 @@ int main(void)
   }
   printf(" %d/%d tests succeeded.\n", ntests-failed-unexpected, ntests);
 
+  /* Nested groups used to be checked by reading a private regex_t layout
+   * copied into this file, which had gone stale -- three of those reads
+   * were carried as xfails because they inspected the wrong bytes. What
+   * the compiler owes its caller is the spans, so assert on those; GNU
+   * Emacs 31 reports exactly these. */
   printf("Testing compilation of nested groups:\n");
-  re_t p = re_compile("\\(\\(ab\\)\\|b\\)+");
+  {
+    static const int abbb[3][2] = {{0, 4}, {3, 4}, {0, 2}};
+    static const int bab[3][2]  = {{0, 3}, {1, 3}, {1, 3}};
+    static const int axb[3][2]  = {{0, 3}, {0, 1}, {2, 3}};
+    static const int aXZb[3][2] = {{0, 5}, {0, 1}, {4, 5}};
+    static const int acabc[3][2] = {{0, 5}, {2, 5}, {3, 4}};
 
-  /* The local regex_t layout here predates the compact 6-byte struct in
-   * re.c, so these group_num/group_start reads are stale and currently
-   * read the wrong bytes. Mark the failing ones xfail until the layout
-   * is reconciled; an XPASS then signals the fix landed. */
-  ntests++;
-  if (p[0].u.group_num != 6)
-  {
-    printf(" [%d] (xfail) wrong [0].group_num %hu for \\(\\(ab\\)\\|b\\)+\n", ntests, p[0].u.group_num);
-  }
-  else { printf(" [%d] XPASS: [0].group_num == 6.\n", ntests); unexpected++; }
-  ntests++;
-  if (p[1].u.group_num != 2)
-  {
-    printf(" [%u] (xfail) wrong [1].group_num %hu.\n", ntests, p[1].u.group_num);
-  }
-  else { printf(" [%u] XPASS: [1].group_num == 2.\n", ntests); unexpected++; }
-  ntests++;
-  if (p[4].u.group_start != 1)
-  {
-    printf(" [%u] (xfail) wrong [4].group_start %hu.\n", ntests, p[4].u.group_start);
-  }
-  else { printf(" [%u] XPASS: [4].group_start == 1.\n", ntests); unexpected++; }
-  ntests++;
-  if (p[7].u.group_start != 0)
-  {
-    printf(" [%u] wrong [7].group_start %hu.\n", ntests, p[7].u.group_start);
-    failed++;
+    ntests++; failed += check_spans("\\(\\(ab\\)\\|b\\)+", "abbb", 3, abbb);
+    ntests++; failed += check_spans("\\(\\(ab\\)\\|b\\)+", "bab", 3, bab);
+    ntests++; failed += check_spans("\\(a\\)x\\(b\\)", "axb", 3, axb);
+    /* The invalid "\x" fallback emits three nodes; when the node count
+     * lagged behind, the *following* group's "\)" scan ran off the front
+     * of the program and this pattern was rejected outright. */
+    ntests++; failed += check_spans("\\(a\\)\\xZ\\(b\\)", "a\\xZb", 3, aXZb);
+    ntests++; failed += check_spans("\\(a\\(b\\)?c\\)+", "acabc", 3, acabc);
   }
 
   printf(" %d/%d tests succeeded.\n", ntests-failed-unexpected, ntests);
