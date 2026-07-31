@@ -1,5 +1,9 @@
-CC := cc
-CFLAGS := -O3 -Wall -Wextra
+# Overridable from the environment as well as the command line: the .ci
+# sanitizer stages export CC/CFLAGS and then run make, and a ":=" here
+# would silently win over that -- every sanitizer stage was in fact
+# building plain "cc -O3 -Wall -Wextra".
+CC ?= cc
+CFLAGS ?= -O3 -Wall -Wextra
 #CFLAGS := -g -Wall -Wextra -std=c99 -DDEBUG
 
 # Number of random text expressions to generate, for random testing
