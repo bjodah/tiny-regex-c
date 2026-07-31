@@ -178,6 +178,35 @@ re_status re_exec(re_t regex,
                   int start_offset,
                   re_match_result* out);
 
+/* Per-call bounds on matching.  Nothing here is remembered between calls:
+ * two executions of the same compiled pattern, on two threads or nested
+ * inside one another, share no mutable state at all.
+ *
+ * `max_steps` bounds total backtracking work and `max_depth` the matcher's
+ * recursion; zero means the engine's default for either.  `cancel`, when
+ * non-NULL, is polled during matching and abandons the attempt as soon as
+ * it returns non-zero -- it is called from inside the matcher, so it must
+ * not re-enter this compiled pattern's own result buffer, though it may
+ * run an unrelated re_exec() of its own.
+ *
+ * Every one of these exits is RE_STATUS_TOO_COMPLEX: the attempt was
+ * abandoned, which is not the same answer as "this text does not match".
+ */
+typedef struct {
+  unsigned long max_steps;
+  unsigned long max_depth;
+  int (*cancel)(void* cancel_data);
+  void* cancel_data;
+} re_exec_options;
+
+/* re_exec() with explicit bounds.  `options` may be NULL, which is exactly
+ * what re_exec() passes. */
+re_status re_exec_with_options(re_t regex,
+                               const char* text,
+                               int start_offset,
+                               const re_exec_options* options,
+                               re_match_result* out);
+
 /* Compile regex string pattern to custom buffer, returning # of bytes used.
  * `re_data` must be aligned to RE_STORAGE_ALIGNMENT; a buffer that is not is
  * rejected (NULL return) rather than written to.  A buffer too small for the
@@ -189,7 +218,14 @@ re_t re_compile_to(const char* pattern,
                    unsigned char* re_data,
                    unsigned* bytes);
 
-/* Compile regex string pattern to a regex_t-array, using internal buffer */
+/* Compile regex string pattern to a regex_t-array, using internal buffer.
+ *
+ * Deprecated. The buffer is one shared static of a fixed size, so this
+ * entry point is neither reentrant nor able to say why it failed: NULL is
+ * returned both for a bad pattern and for a pattern that merely outgrew
+ * the buffer (about 29 literal characters). re_compile_checked() tells
+ * those apart, reports the size it wants, and writes only where the caller
+ * says. */
 re_t re_compile(const char* pattern);
 
 /* Reconstruct a regex string from a compiled pattern */

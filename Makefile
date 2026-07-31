@@ -34,8 +34,14 @@ tests/test_rand: re.c tests/test_rand.c
 	@$(CC) -I. $(CFLAGS) re.c tests/test_rand.c     -o $@
 tests/test_rand_neg: re.c tests/test_rand_neg.c
 	@$(CC) -I. $(CFLAGS) re.c tests/test_rand_neg.c -o $@
+# test_api.c runs two executions at once to show they share no state.
+# Clear TEST_PTHREAD_FLAGS to build it without threads.
+# _POSIX_C_SOURCE: the sanitizer stages build with -std=c2x, under which
+# glibc hides pthread_barrier_* unless a feature macro asks for it.
+TEST_PTHREAD_FLAGS ?= -DRE_TEST_PTHREADS -D_POSIX_C_SOURCE=200809L -pthread
+
 tests/test_api: re.c tests/test_api.c
-	@$(CC) -I. $(CFLAGS) re.c tests/test_api.c      -o $@
+	@$(CC) -I. $(CFLAGS) $(TEST_PTHREAD_FLAGS) re.c tests/test_api.c -o $@
 
 clean:
 	@rm -f $(TEST_BINS)

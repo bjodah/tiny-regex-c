@@ -101,6 +101,12 @@
 #define MAX_MATCH_DEPTH 64 /* faster formal proofs */
 #endif
 
+/* How often re_exec_options' cancel callback is polled, in work units.
+ * A power of two, and the phase is chosen so the very first unit polls:
+ * a callback that always cancels then cancels immediately, however small
+ * the pattern. */
+#define RE_CANCEL_POLL_STEPS 256u
+
 #ifdef DEBUG
 #define DEBUG_P(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -298,6 +304,12 @@ static re_t getnext(regex_t* pattern) {
   return (re_t)(((unsigned char*)pattern) + getsize(pattern));
 }
 
+/* getnext() for the execute path, which never writes to the program: the
+ * only pass that does is the compile-time ICASE marking. */
+static const regex_t* next_node(const regex_t* pattern) {
+  return (const regex_t*)((const unsigned char*)pattern + getsize(pattern));
+}
+
 /* ------------------------------------------------------------------------
  * Compile-time emitter
  *
@@ -359,12 +371,6 @@ static int emit_char(struct re_emitter* em, unsigned cp) {
   return 1;
 }
 
-/* Backtracking budget for the current top-level match attempt; both are
- * reset in re_matchp_internal() and consumed by match_seq(). See
- * MAX_MATCH_STEPS and MAX_MATCH_DEPTH. */
-static long re_match_steps;
-static long re_match_depth;
-
 static void save_spans(re_span spans[RE_MAX_SPANS],
                        const re_match_result* out) {
   if (out)
@@ -388,7 +394,7 @@ static void reset_spans(re_match_result* out) {
 
 /* Private function declarations: */
 static int matchcharclass(const re_glyph* g, const char* str, int icase);
-static int matchone(regex_t* p, const re_glyph* g);
+static int matchone(const regex_t* p, const re_glyph* g);
 static int matchdigit(int c);
 static int matchalpha(int c);
 static int matchwhitespace(int c);
@@ -401,7 +407,9 @@ static int re_matchp_internal(re_t pattern,
                               const char* text,
                               int* matchlength,
                               const char* text_start,
-                              re_match_result* out);
+                              const re_exec_options* options,
+                              re_match_result* out,
+                              int* exhausted);
 
 /* Public functions: */
 int re_match(const char* pattern, const char* text, int* matchlength) {
@@ -475,6 +483,16 @@ re_status re_exec(re_t regex,
                   const char* text,
                   int start_offset,
                   re_match_result* out) {
+  return re_exec_with_options(regex, text, start_offset, NULL, out);
+}
+
+re_status re_exec_with_options(re_t regex,
+                               const char* text,
+                               int start_offset,
+                               const re_exec_options* options,
+                               re_match_result* out) {
+  int exhausted = 0;
+
   if (!regex) {
     return RE_STATUS_BAD_PATTERN;
   }
@@ -487,7 +505,7 @@ re_status re_exec(re_t regex,
   }
 
   int num_groups = 0;
-  re_t p_node = regex;
+  const regex_t* p_node = regex;
   while (p_node) {
     if ((p_node->type & ~RE_TYPE_ICASE) == GROUP) {
       if (p_node->u.group_num > num_groups) {
@@ -496,7 +514,7 @@ re_status re_exec(re_t regex,
     }
     if ((p_node->type & ~RE_TYPE_ICASE) == UNUSED)
       break;
-    p_node = getnext(p_node);
+    p_node = next_node(p_node);
   }
 
   if (out) {
@@ -505,8 +523,8 @@ re_status re_exec(re_t regex,
   reset_spans(out);
 
   int matchlength = 0;
-  int res =
-      re_matchp_internal(regex, text + start_offset, &matchlength, text, out);
+  int res = re_matchp_internal(regex, text + start_offset, &matchlength, text,
+                               options, out, &exhausted);
   if (res >= 0) {
     if (out) {
       out->spans[0].start = start_offset + res;
@@ -515,7 +533,9 @@ re_status re_exec(re_t regex,
     return RE_STATUS_OK;
   }
 
-  if (re_match_steps > MAX_MATCH_STEPS) {
+  /* Out of budget, or cancelled: the attempt was abandoned, which is not
+   * the same answer as "this text does not match". */
+  if (exhausted) {
     return RE_STATUS_TOO_COMPLEX;
   }
 
@@ -1288,7 +1308,7 @@ static int matchcharclass(const re_glyph* g, const char* str, int icase) {
   return 0;
 }
 
-static int matchone(regex_t* p, const re_glyph* g) {
+static int matchone(const regex_t* p, const re_glyph* g) {
   DEBUG_P("ONE %d matches %u?\n", p->type, g->cp);
   int icase = (p->type & RE_TYPE_ICASE) != 0;
   int c = ascii_cp(g->cp);
@@ -1344,31 +1364,41 @@ enum cont_kind { CONT_SEQ, CONT_REP };
 typedef struct re_cont {
   const struct re_cont* next;
   unsigned char kind;
-  regex_t* p;
-  regex_t* stop;
+  const regex_t* p;
+  const regex_t* stop;
   const char* iter;  /* CONT_REP: where this repetition began */
   unsigned min, max; /* CONT_REP: bounds; RE_REP_INF max is unbounded */
   unsigned done;     /* CONT_REP: repetitions completed */
 } re_cont;
 
 typedef struct {
-  const char* text_start; /* offset 0 for reported spans, and where '^'
-                           * holds -- re_exec()'s start_offset says where
-                           * to resume scanning, not where the line begins */
-  regex_t* prog_end;      /* the UNUSED sentinel */
+  const char* text_start;  /* offset 0 for reported spans, and where '^'
+                            * holds -- re_exec()'s start_offset says where
+                            * to resume scanning, not where the line begins */
+  const regex_t* prog_end; /* the UNUSED sentinel */
   re_match_result* out;
   int has_branch; /* whether the pattern contains '\|' at all */
+
+  /* The budget for this attempt, and only this one.  These used to be
+   * file-scope statics, so a second execution -- on another thread, or
+   * started from a cancellation callback -- reset and then spent the
+   * first one's allowance. */
+  unsigned long steps, max_steps;
+  unsigned long depth, max_depth;
+  int exhausted; /* budget spent or cancelled: not an honest no-match */
+  int (*cancel)(void*);
+  void* cancel_data;
 } re_ctx;
 
-static const char* match_seq(regex_t* p,
-                             regex_t* stop,
+static const char* match_seq(const regex_t* p,
+                             const regex_t* stop,
                              const char* text,
                              const re_cont* k,
                              re_ctx* ctx);
 static const char* match_cont(const re_cont* k, const char* text, re_ctx* ctx);
 static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx);
-static const char* match_group_iter(regex_t* g,
-                                    regex_t* gend,
+static const char* match_group_iter(const regex_t* g,
+                                    const regex_t* gend,
                                     const char* text,
                                     unsigned done,
                                     unsigned min,
@@ -1383,8 +1413,8 @@ static unsigned short node_type(const regex_t* p) {
 /* The GROUPEND closing the group headed by 'g'. Found by walking the
  * nesting rather than by trusting GROUP's own 8-bit group_size, which a
  * group of more than 255 nodes overflows. */
-static regex_t* group_end(regex_t* g, const re_ctx* ctx) {
-  regex_t* p = getnext(g);
+static const regex_t* group_end(const regex_t* g, const re_ctx* ctx) {
+  const regex_t* p = next_node(g);
   int depth = 1;
 
   while (p < ctx->prog_end) {
@@ -1393,25 +1423,29 @@ static regex_t* group_end(regex_t* g, const re_ctx* ctx) {
       depth++;
     else if (type == GROUPEND && --depth == 0)
       break;
-    p = getnext(p);
+    p = next_node(p);
   }
   return p;
 }
 
 /* One past the atom starting at 'p', where a whole group is one atom. */
-static regex_t* atom_end(regex_t* p, regex_t* stop, const re_ctx* ctx) {
-  regex_t* end = node_type(p) == GROUP ? group_end(p, ctx) : p;
+static const regex_t* atom_end(const regex_t* p,
+                               const regex_t* stop,
+                               const re_ctx* ctx) {
+  const regex_t* end = node_type(p) == GROUP ? group_end(p, ctx) : p;
 
   if (end >= ctx->prog_end)
     return stop;
-  end = getnext(end);
+  end = next_node(end);
   return end < stop ? end : stop;
 }
 
 /* The first '\|' in [p, stop) that belongs to this level: alternation
  * separates whole concatenations, so a BRANCH inside a nested group is
  * that group's business, not ours. NULL when there is none. */
-static regex_t* find_branch(regex_t* p, regex_t* stop, const re_ctx* ctx) {
+static const regex_t* find_branch(const regex_t* p,
+                                  const regex_t* stop,
+                                  const re_ctx* ctx) {
   while (p < stop) {
     if (node_type(p) == BRANCH)
       return p;
@@ -1461,9 +1495,9 @@ static re_span* group_span(const re_ctx* ctx, const regex_t* g) {
 /* "a\|b": try the alternatives left to right, leftmost-first like Emacs.
  * [p, br) is the first alternative and [br+1, stop) is everything after
  * it, which recursion splits again at the next '\|'. */
-static const char* match_alt(regex_t* p,
-                             regex_t* br,
-                             regex_t* stop,
+static const char* match_alt(const regex_t* p,
+                             const regex_t* br,
+                             const regex_t* stop,
                              const char* text,
                              const re_cont* k,
                              re_ctx* ctx) {
@@ -1475,7 +1509,7 @@ static const char* match_alt(regex_t* p,
   if (end)
     return end;
   restore_spans(ctx->out, saved);
-  end = match_seq(getnext(br), stop, text, k, ctx);
+  end = match_seq(next_node(br), stop, text, k, ctx);
   if (end)
     return end;
   restore_spans(ctx->out, saved);
@@ -1487,7 +1521,7 @@ static const char* match_alt(regex_t* p,
  * as the atom allows, then hand glyphs back one at a time until the rest
  * of the pattern fits.  The count is in glyphs, so "å\{2\}" wants two
  * characters, but 'pos' stays a byte pointer. */
-static const char* match_atom(regex_t* p,
+static const char* match_atom(const regex_t* p,
                               const char* text,
                               unsigned min,
                               unsigned max,
@@ -1536,7 +1570,7 @@ static const char* match_anchor(const regex_t* p,
 
 /* A group, quantified or not (an unquantified one is just min == max == 1).
  * Greedy: entering the group is tried before skipping it. */
-static const char* match_group(regex_t* g,
+static const char* match_group(const regex_t* g,
                                const char* text,
                                unsigned min,
                                unsigned max,
@@ -1558,8 +1592,8 @@ static const char* match_group(regex_t* g,
 }
 
 /* Start repetition number 'done' + 1 of the group headed by 'g'. */
-static const char* match_group_iter(regex_t* g,
-                                    regex_t* gend,
+static const char* match_group_iter(const regex_t* g,
+                                    const regex_t* gend,
                                     const char* text,
                                     unsigned done,
                                     unsigned min,
@@ -1582,7 +1616,7 @@ static const char* match_group_iter(regex_t* g,
   rep.min = min;
   rep.max = max;
   rep.done = done;
-  return match_seq(getnext(g), gend, text, &rep, ctx);
+  return match_seq(next_node(g), gend, text, &rep, ctx);
 }
 
 /* One repetition of a group finished at 'text': close its capture, then
@@ -1635,21 +1669,21 @@ static const char* match_cont(const re_cont* k, const char* text, re_ctx* ctx) {
 }
 
 /* Match the node run [p, stop) at 'text', then the continuation 'k'. */
-static const char* match_seq_body(regex_t* p,
-                                  regex_t* stop,
+static const char* match_seq_body(const regex_t* p,
+                                  const regex_t* stop,
                                   const char* text,
                                   const re_cont* k,
                                   re_ctx* ctx) {
   unsigned short type;
   unsigned min = 1, max = 1;
-  regex_t* after;
+  const regex_t* after;
   re_cont rest;
 
   if (p >= stop || node_type(p) == UNUSED)
     return match_cont(k, text, ctx);
 
   if (ctx->has_branch) {
-    regex_t* br = find_branch(p, stop, ctx);
+    const regex_t* br = find_branch(p, stop, ctx);
     if (br)
       return match_alt(p, br, stop, text, k, ctx);
   }
@@ -1675,40 +1709,66 @@ static const char* match_seq_body(regex_t* p,
   return match_atom(p, text, min, max, &rest, ctx);
 }
 
-static const char* match_seq(regex_t* p,
-                             regex_t* stop,
+/* Charge one unit of work and one frame of depth to this attempt's budget.
+ * Returns 0 -- and latches ctx->exhausted, so the whole attempt unwinds at
+ * once rather than reporting an honest no-match -- when the budget is spent
+ * or the caller's cancel callback says to stop. */
+static int budget_enter(re_ctx* ctx) {
+  if (ctx->exhausted)
+    return 0;
+  if (++ctx->steps > ctx->max_steps || ctx->depth >= ctx->max_depth ||
+      (ctx->cancel && (ctx->steps & (RE_CANCEL_POLL_STEPS - 1)) == 1 &&
+       ctx->cancel(ctx->cancel_data))) {
+    ctx->exhausted = 1;
+    return 0;
+  }
+  ctx->depth++;
+  return 1;
+}
+
+static const char* match_seq(const regex_t* p,
+                             const regex_t* stop,
                              const char* text,
                              const re_cont* k,
                              re_ctx* ctx) {
   const char* end;
 
-  if (++re_match_steps > MAX_MATCH_STEPS)
+  if (!budget_enter(ctx))
     return NULL;
-  if (++re_match_depth > MAX_MATCH_DEPTH) {
-    /* Out of stack budget. Spend the step budget too, so the attempt
-     * unwinds at once and re_exec() reports it as TOO_COMPLEX. */
-    re_match_steps = MAX_MATCH_STEPS + 1;
-    re_match_depth--;
-    return NULL;
-  }
   end = match_seq_body(p, stop, text, k, ctx);
-  re_match_depth--;
+  ctx->depth--;
   return end;
 }
 
 static void init_ctx(re_ctx* ctx,
                      re_t pattern,
                      const char* text_start,
+                     const re_exec_options* options,
                      re_match_result* out) {
-  regex_t* p = pattern;
+  const regex_t* p = pattern;
 
   ctx->text_start = text_start;
   ctx->out = out;
   ctx->has_branch = 0;
+  ctx->steps = 0;
+  ctx->depth = 0;
+  ctx->exhausted = 0;
+  ctx->max_steps = MAX_MATCH_STEPS;
+  ctx->max_depth = MAX_MATCH_DEPTH;
+  ctx->cancel = NULL;
+  ctx->cancel_data = NULL;
+  if (options) {
+    if (options->max_steps)
+      ctx->max_steps = options->max_steps;
+    if (options->max_depth)
+      ctx->max_depth = options->max_depth;
+    ctx->cancel = options->cancel;
+    ctx->cancel_data = options->cancel_data;
+  }
   while (node_type(p) != UNUSED) {
     if (node_type(p) == BRANCH)
       ctx->has_branch = 1;
-    p = getnext(p);
+    p = next_node(p);
   }
   ctx->prog_end = p;
 }
@@ -1717,18 +1777,18 @@ static int re_matchp_internal(re_t pattern,
                               const char* text,
                               int* matchlength,
                               const char* text_start,
-                              re_match_result* out) {
+                              const re_exec_options* options,
+                              re_match_result* out,
+                              int* exhausted) {
   re_ctx ctx;
   int anchored;
   int idx = 0;
 
-  re_match_steps = 0;
-  re_match_depth = 0;
   *matchlength = 0;
   if (!pattern)
     return -1;
 
-  init_ctx(&ctx, pattern, text_start, out);
+  init_ctx(&ctx, pattern, text_start, options, out);
   /* A leading '^' can only hold at the start of the subject, so no offset
    * past the first one is worth trying -- and when the scan resumes past
    * it, not even that one can match.  Unless a '\|' means the anchor
@@ -1745,11 +1805,12 @@ static int re_matchp_internal(re_t pattern,
       *matchlength = (int)(end - (text + idx));
       return idx;
     }
-    if (anchored || text[idx] == '\0')
+    if (anchored || ctx.exhausted || text[idx] == '\0')
       break;
     idx += (int)glyph_at(text + idx).len;
   }
 
+  *exhausted = ctx.exhausted;
   return -1;
 }
 

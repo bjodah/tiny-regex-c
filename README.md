@@ -162,6 +162,35 @@ ordinary literal `?`.)
 `start_offset`: that argument says where to resume scanning, so a
 `^`-anchored pattern cannot match at a non-zero offset.
 
+### Bounds, cancellation, and reentrancy
+A match attempt is bounded: `re_exec()` returns `RE_STATUS_TOO_COMPLEX`
+rather than backtracking forever, and that answer is deliberately not
+`RE_STATUS_NO_MATCH` -- the attempt was abandoned, which says nothing
+about whether the text matches.
+
+`re_exec_with_options()` sets those bounds per call, and can pass a
+`cancel` callback that the matcher polls and obeys:
+
+```C
+re_exec_options opts = {0};
+opts.max_steps = 100000;
+opts.cancel = user_pressed_ctrl_g;
+opts.cancel_data = editor;
+re_status st = re_exec_with_options(regex, text, 0, &opts, &result);
+```
+
+Nothing is remembered between calls. Two executions of the same compiled
+pattern -- on two threads, or one started from the other's cancel
+callback -- share no mutable state, and the execute path does not write
+to the compiled program at all. `tests/test_api.c` runs both cases on
+two threads, and `.ci/ci-08-clang-tsan.sh` runs that under
+ThreadSanitizer.
+
+`re_compile()` is the exception and is deprecated: it compiles into one
+shared static buffer, so it is neither reentrant nor able to say whether
+it failed on a bad pattern or merely on a pattern too long for it (about
+29 characters). Use `re_compile_checked()`.
+
 ### Caller-supplied storage
 `re_compile_checked()` and `re_compile_to()` compile into a buffer the
 caller owns. A compiled program is not an opaque byte string -- the engine

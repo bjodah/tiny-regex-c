@@ -8,7 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef RE_TEST_PTHREADS
+#include <pthread.h>
+#endif
+
 #include "re.h"
+
+/* A pattern that backtracks catastrophically, and a subject with no 'b'
+ * in it, so a match attempt can only end by running out of budget. */
+#define RE_SLOW_PATTERN "\\(a*\\)*b"
+#define RE_SLOW_TEXT "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 /* A pattern, a subject and the spans GNU Emacs reports for it.  nspans 0
  * means "must not match"; a span of {-1, -1} is a group that did not
@@ -93,6 +102,253 @@ static int check_spans(const struct span_case* c) {
       failed++;
     }
   }
+  return failed;
+}
+
+/* Compile 'pattern' into 'storage', aborting the test on failure. */
+static re_t compile_or_die(const char* pattern, unsigned char* storage,
+                           unsigned bytes) {
+  re_t regex = NULL;
+  unsigned size = bytes;
+
+  if (re_compile_checked(pattern, RE_FLAG_NONE, storage, &size, &regex) !=
+      RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: could not compile \"%s\"\n", pattern);
+    exit(1);
+  }
+  return regex;
+}
+
+/* A cancel callback that runs a whole re_exec() of its own, with a budget
+ * so small the nested attempt is always abandoned, and then lets the outer
+ * attempt continue.  With the budget in file-scope statics, the nested run
+ * both reset the outer's step count and left it poisoned on the way out. */
+struct nesting_probe {
+  re_t nested;
+  int calls;
+  int nested_status;
+};
+
+static int cancel_running_nested_exec(void* data) {
+  struct nesting_probe* probe = data;
+  re_exec_options tiny = {0};
+  re_match_result res;
+
+  tiny.max_steps = 50;
+  probe->calls++;
+  probe->nested_status =
+      (int)re_exec_with_options(probe->nested, RE_SLOW_TEXT, 0, &tiny, &res);
+  return 0;
+}
+
+static int cancel_always(void* data) {
+  ++*(int*)data;
+  return 1;
+}
+
+#ifdef RE_TEST_PTHREADS
+struct racer {
+  re_t regex;
+  const char* text;
+  re_exec_options options;
+  re_status expected;
+  int failed;
+  int rounds;
+};
+
+/* Both racers wait here, so the two matching loops really do overlap:
+ * without it the first thread can finish before the second starts and the
+ * test proves nothing.  Blocking rather than spinning -- under Valgrind,
+ * where one thread runs at a time, a spin wait costs minutes. */
+static pthread_barrier_t racers_start;
+
+static void* race(void* data) {
+  struct racer* r = data;
+  int i;
+
+  pthread_barrier_wait(&racers_start);
+  for (i = 0; i < r->rounds; i++) {
+    re_match_result res;
+    re_status status =
+        re_exec_with_options(r->regex, r->text, 0, &r->options, &res);
+    if (status != r->expected)
+      r->failed++;
+    if (status == RE_STATUS_OK && res.spans[0].start != 0)
+      r->failed++;
+  }
+  return NULL;
+}
+
+/* Run two racers concurrently and report how many checks failed. */
+static int run_racers(struct racer* a, struct racer* b) {
+  pthread_t ta, tb;
+
+  if (pthread_barrier_init(&racers_start, NULL, 2))
+    return 1;
+  if (pthread_create(&ta, NULL, race, a) || pthread_create(&tb, NULL, race, b))
+    return 1;
+  pthread_join(ta, NULL);
+  pthread_join(tb, NULL);
+  pthread_barrier_destroy(&racers_start);
+  return a->failed + b->failed;
+}
+#endif
+
+/* Everything the matcher remembers between calls -- which, since the work
+ * budget moved into the per-execution context, is nothing. */
+static int test_execution_state(void) {
+  _Alignas(RE_STORAGE_ALIGNMENT) static unsigned char slow_storage[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) static unsigned char fast_storage[256];
+  re_t slow = compile_or_die(RE_SLOW_PATTERN, slow_storage,
+                             sizeof(slow_storage));
+  re_t fast = compile_or_die("a\\{3\\}", fast_storage, sizeof(fast_storage));
+  re_exec_options opts;
+  re_match_result res;
+  re_status status;
+  int failed = 0;
+
+  /* A small budget is spent, and reported as such rather than as a plain
+   * no-match. */
+  memset(&opts, 0, sizeof(opts));
+  opts.max_steps = 200;
+  status = re_exec_with_options(slow, RE_SLOW_TEXT, 0, &opts, &res);
+  if (status != RE_STATUS_TOO_COMPLEX) {
+    fprintf(stderr, "FAIL: a 200-step budget gave %d, expected TOO_COMPLEX\n",
+            status);
+    failed++;
+  }
+  /* ... and it belongs to that call alone: the next one starts fresh. */
+  if (re_exec(fast, "aaa", 0, &res) != RE_STATUS_OK || res.spans[0].end != 3) {
+    fprintf(stderr, "FAIL: a spent budget leaked into the next execution\n");
+    failed++;
+  }
+  memset(&opts, 0, sizeof(opts));
+  opts.max_depth = 4;
+  if (re_exec_with_options(slow, RE_SLOW_TEXT, 0, &opts, &res) !=
+      RE_STATUS_TOO_COMPLEX) {
+    fprintf(stderr, "FAIL: a 4-frame depth budget was not reported\n");
+    failed++;
+  }
+  if (re_exec(fast, "aaa", 0, &res) != RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: a spent depth budget leaked into the next run\n");
+    failed++;
+  }
+
+  /* Cancellation is TOO_COMPLEX -- the attempt was abandoned -- and the
+   * compiled pattern is reusable afterwards. */
+  {
+    int calls = 0;
+    memset(&opts, 0, sizeof(opts));
+    opts.cancel = cancel_always;
+    opts.cancel_data = &calls;
+    if (re_exec_with_options(fast, "aaa", 0, &opts, &res) !=
+        RE_STATUS_TOO_COMPLEX) {
+      fprintf(stderr, "FAIL: cancellation did not abandon the attempt\n");
+      failed++;
+    }
+    if (calls == 0) {
+      fprintf(stderr, "FAIL: the cancel callback was never polled\n");
+      failed++;
+    }
+    if (re_exec(fast, "aaa", 0, &res) != RE_STATUS_OK) {
+      fprintf(stderr, "FAIL: a cancelled pattern did not run again\n");
+      failed++;
+    }
+  }
+
+  /* A callback that runs a nested execution of its own must not spend the
+   * outer attempt's budget. */
+  {
+    struct nesting_probe probe;
+    probe.nested = slow;
+    probe.calls = 0;
+    probe.nested_status = (int)RE_STATUS_OK;
+    memset(&opts, 0, sizeof(opts));
+    opts.cancel = cancel_running_nested_exec;
+    opts.cancel_data = &probe;
+    status = re_exec_with_options(fast, "aaa", 0, &opts, &res);
+    if (status != RE_STATUS_OK || res.spans[0].end != 3) {
+      fprintf(stderr,
+              "FAIL: a nested execution inside the cancel callback broke the "
+              "outer one: status %d\n",
+              status);
+      failed++;
+    }
+    if (probe.calls == 0 ||
+        probe.nested_status != (int)RE_STATUS_TOO_COMPLEX) {
+      fprintf(stderr,
+              "FAIL: the nested execution did not run bounded by its own "
+              "budget (%d calls, status %d)\n",
+              probe.calls, probe.nested_status);
+      failed++;
+    }
+  }
+
+  /* re_compile()'s static buffer holds MAX_REGEXP_OBJECTS nodes and says
+   * nothing when a pattern outgrows it: NULL is indistinguishable from a
+   * bad pattern.  re_compile_checked() is the entry point that reports
+   * the difference, and the one every caller here uses. */
+  {
+    char atoms[64];
+    unsigned needed = 0;
+    re_t sized = NULL;
+
+    memset(atoms, 'a', sizeof(atoms));
+    atoms[29] = '\0';
+    if (re_compile(atoms) == NULL) {
+      fprintf(stderr, "FAIL: re_compile() rejected 29 literal atoms\n");
+      failed++;
+    }
+    atoms[29] = 'a';
+    atoms[30] = '\0';
+    if (re_compile(atoms) != NULL) {
+      fprintf(stderr, "FAIL: re_compile() took 30 literal atoms\n");
+      failed++;
+    }
+    if (re_compile_checked(atoms, RE_FLAG_NONE, NULL, &needed, &sized) !=
+        RE_STATUS_BUFFER_TOO_SMALL) {
+      fprintf(stderr,
+              "FAIL: re_compile_checked() did not report 30 atoms as a size "
+              "problem\n");
+      failed++;
+    }
+  }
+
+#ifdef RE_TEST_PTHREADS
+  /* Two executions at once share no mutable state: neither on one compiled
+   * program nor across two, and a budget spent on one thread is not spent
+   * on the other. */
+  {
+    struct racer same_a, same_b, mixed_slow, mixed_fast;
+
+    memset(&same_a, 0, sizeof(same_a));
+    same_a.regex = fast;
+    same_a.text = "aaa";
+    same_a.expected = RE_STATUS_OK;
+    same_a.rounds = 400;
+    same_b = same_a;
+    failed += run_racers(&same_a, &same_b);
+
+    memset(&mixed_slow, 0, sizeof(mixed_slow));
+    mixed_slow.regex = slow;
+    mixed_slow.text = RE_SLOW_TEXT;
+    mixed_slow.options.max_steps = 3000;
+    mixed_slow.expected = RE_STATUS_TOO_COMPLEX;
+    mixed_slow.rounds = 40;
+
+    memset(&mixed_fast, 0, sizeof(mixed_fast));
+    mixed_fast.regex = fast;
+    mixed_fast.text = "aaa";
+    mixed_fast.expected = RE_STATUS_OK;
+    mixed_fast.rounds = 400;
+    failed += run_racers(&mixed_slow, &mixed_fast);
+
+    if (failed)
+      fprintf(stderr, "FAIL: concurrent executions disagreed with serial "
+                      "ones\n");
+  }
+#endif
+
   return failed;
 }
 
@@ -983,6 +1239,8 @@ int main(void) {
       }
     }
   }
+
+  failed += test_execution_state();
 
   printf("%d/%d tests succeeded.\n", failed == 0, 1);
   return failed ? 1 : 0;
