@@ -168,6 +168,15 @@ rather than backtracking forever, and that answer is deliberately not
 `RE_STATUS_NO_MATCH` -- the attempt was abandoned, which says nothing
 about whether the text matches.
 
+One quantified group may be expanded at most 256 times, and reaching that
+ceiling is `RE_STATUS_TOO_COMPLEX` too. Intervals accept counts up to
+65535 and the matcher will not pretend otherwise: `\(a\)\{257\}` used to
+report a plain no-match and `\(a\)*` over 300 `a`s used to answer with a
+256-character match, neither of which is true. A group whose body matches
+empty is the exception, and matches Emacs: it can satisfy any minimum
+count, so `\(a*\)\{300\}` matches the empty string. Counts on a single
+atom (`a\{300\}`) are not affected -- no group is expanded.
+
 `re_exec_with_options()` sets those bounds per call, and can pass a
 `cancel` callback that the matcher polls and obeys:
 

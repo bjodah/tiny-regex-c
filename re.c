@@ -70,8 +70,17 @@
 #define RE_REP_INF UINT_MAX
 
 /* Bound on the number of times a quantified group ("\(...\)+" etc.) is
- * expanded. Each repetition is one more frame on the C stack, so this caps
- * how far a single group can drive the matcher down. */
+ * expanded. Each repetition is two more match_seq() frames on the C stack
+ * -- measured at 768 bytes per repetition with gcc -O2, 1072 with gcc -O0
+ * and about 1.5 KiB under clang's AddressSanitizer -- so this caps how far
+ * a single group can drive the matcher down.
+ *
+ * Reaching it is RE_STATUS_TOO_COMPLEX, not a no-match and not a shorter
+ * match than the pattern asked for; see match_rep(). Raising it is not a
+ * matter of changing the number: MAX_MATCH_DEPTH stops a counted group at
+ * 2047 repetitions whatever this says, and the megabytes of C stack that
+ * takes are why the pending work is to move the continuation chain off the
+ * stack rather than to raise either constant. */
 #ifndef CPROVER
 #define MAX_GROUP_REPEATS 256
 #else
@@ -93,8 +102,11 @@
  * on the C stack (see the continuation frames below), so a pattern that
  * both repeats a lot and nests can grow the stack without ever running out
  * of steps; overrunning this is reported as RE_STATUS_TOO_COMPLEX rather
- * than smashing the stack. One unit is one match_seq() frame, a few hundred
- * bytes of stack, so the ceiling stays comfortably under a megabyte. */
+ * than smashing the stack. One unit is one match_seq() frame; measured
+ * against a counted group, 4096 of them are 1.5 MB of stack at gcc -O2,
+ * 2.2 MB at -O0 and over 3 MB under AddressSanitizer. That is the real
+ * worst case a caller must have stack for, and it is the number to bring
+ * down by moving the continuation chain off the C stack. */
 #ifndef CPROVER
 #define MAX_MATCH_DEPTH 4096
 #else
@@ -1603,8 +1615,6 @@ static const char* match_group_iter(const regex_t* g,
   re_span* span = group_span(ctx, g);
   re_cont rep;
 
-  if (done >= MAX_GROUP_REPEATS)
-    return NULL;
   if (span)
     span->start = (int)(text - ctx->text_start);
 
@@ -1642,14 +1652,28 @@ static const char* match_rep(const re_cont* k, const char* text, re_ctx* ctx) {
     span->end = (int)(text - ctx->text_start);
 
   if ((grew || done <= k->min) && done < k->max) {
-    re_span saved[RE_MAX_SPANS];
-    const char* end;
-    save_spans(saved, ctx->out);
-    end = match_group_iter(k->p, k->stop, text, done, k->min, k->max, k->next,
-                           ctx);
-    if (end)
-      return end;
-    restore_spans(ctx->out, saved);
+    /* Out of repetitions for this group.  A repetition that consumed
+     * leaves only one answer this engine could still give -- a match
+     * *shorter* than the pattern asks for, "\(a\)*" over 300 a's
+     * stopping at 256 -- so report the ceiling rather than that answer.
+     * An empty body has nothing left to consume and can still satisfy
+     * whatever is left of 'min', which is the fallback below and what
+     * makes "\(a*\)\{300\}" match the empty string, as Emacs does. */
+    if (done >= MAX_GROUP_REPEATS) {
+      if (grew) {
+        ctx->exhausted = 1;
+        return NULL;
+      }
+    } else {
+      re_span saved[RE_MAX_SPANS];
+      const char* end;
+      save_spans(saved, ctx->out);
+      end = match_group_iter(k->p, k->stop, text, done, k->min, k->max, k->next,
+                             ctx);
+      if (end)
+        return end;
+      restore_spans(ctx->out, saved);
+    }
   }
   /* Leaving early on an empty body is the fallback, not the first choice:
    * it only matters once repeating is out of reach -- a 'min' past

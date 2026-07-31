@@ -191,6 +191,12 @@ re_status re_exec(re_t regex,
  *
  * Every one of these exits is RE_STATUS_TOO_COMPLEX: the attempt was
  * abandoned, which is not the same answer as "this text does not match".
+ * So is the engine's ceiling on how often one quantified group may be
+ * expanded, which is 256: '\(a\)\{257\}' and '\(a\)*' over 300 'a's are
+ * both TOO_COMPLEX rather than, as they used to be, a false no-match and
+ * a match 256 characters long.  A group whose body matches empty still
+ * satisfies any minimum count, as it does in Emacs, and a count on a
+ * single atom ('a\{300\}') expands no group at all.
  */
 typedef struct {
   unsigned long max_steps;

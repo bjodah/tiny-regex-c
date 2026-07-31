@@ -352,6 +352,137 @@ static int test_execution_state(void) {
   return failed;
 }
 
+/* The ceiling on how often one quantified group may be expanded.
+ *
+ * Counted repetitions past it used to be reported as an ordinary
+ * no-match, and a '*' or '+' past it as a *shorter* match than the
+ * pattern asked for -- "\(a\)*" over 300 a's answering [0, 256). Both are
+ * now RE_STATUS_TOO_COMPLEX. What must not change is the empty-body
+ * fallback: a group whose body matches empty can still satisfy a minimum
+ * count past the ceiling, and GNU Emacs 31 agrees that it does. */
+static int test_group_repeat_ceiling(void) {
+  static const int counts[] = {255, 256, 257, 300};
+  _Alignas(RE_STORAGE_ALIGNMENT) static unsigned char storage[256];
+  char pattern[64];
+  char subject[512];
+  size_t c;
+  int failed = 0;
+
+  for (c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+    int n = counts[c];
+    /* Under the ceiling nothing changes; over it, the honest answer. */
+    int over = n > 256;
+    re_status want = over ? RE_STATUS_TOO_COMPLEX : RE_STATUS_OK;
+    struct {
+      const char* form;
+      re_status status;
+      int group_start; /* expected span 1 when the status is OK */
+      int group_end;
+    } cases[] = {
+        /* a group that has to consume: the ceiling binds */
+        {"\\(a\\)\\{%d\\}", want, n - 1, n},
+        {"\\(\\(a\\)\\)\\{%d\\}", want, n - 1, n},
+        /* the same count on a single atom has no group to expand */
+        {"a\\{%d\\}", RE_STATUS_OK, -1, -1},
+        /* an empty body satisfies any minimum, ceiling or no ceiling */
+        {"\\(a*\\)\\{%d\\}", RE_STATUS_OK, 0, 0},
+        {"\\(\\)\\{%d\\}", RE_STATUS_OK, 0, 0},
+    };
+    size_t i;
+
+    memset(subject, 'a', (size_t)n);
+    subject[n] = '\0';
+
+    for (i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+      unsigned size = sizeof(storage);
+      re_t regex = NULL;
+      re_match_result res;
+      re_status status;
+      /* The empty-body forms are run against the empty subject, which is
+       * where the fallback is the only way to a match at all. */
+      const char* text = cases[i].group_end == 0 ? "" : subject;
+
+      snprintf(pattern, sizeof(pattern), cases[i].form, n);
+      if (re_compile_checked(pattern, RE_FLAG_NONE, storage, &size, &regex) !=
+          RE_STATUS_OK) {
+        fprintf(stderr, "FAIL: could not compile \"%s\"\n", pattern);
+        failed++;
+        continue;
+      }
+      status = re_exec(regex, text, 0, &res);
+      if (status != cases[i].status) {
+        fprintf(stderr, "FAIL: \"%s\" on %d a's returned %d, expected %d\n",
+                pattern, (int)strlen(text), status, cases[i].status);
+        failed++;
+        continue;
+      }
+      if (status != RE_STATUS_OK || cases[i].group_start < 0)
+        continue;
+      if (res.spans[1].start != cases[i].group_start ||
+          res.spans[1].end != cases[i].group_end) {
+        fprintf(stderr,
+                "FAIL: \"%s\" left group 1 as [%d, %d), expected [%d, %d)\n",
+                pattern, res.spans[1].start, res.spans[1].end,
+                cases[i].group_start, cases[i].group_end);
+        failed++;
+      }
+    }
+
+    /* "\(a*\)\{n\}b" on "b": the fallback has to leave the loop *and*
+     * let what follows match.  Emacs reports [0, 1) with group 1 empty. */
+    {
+      unsigned size = sizeof(storage);
+      re_t regex = NULL;
+      re_match_result res;
+
+      snprintf(pattern, sizeof(pattern), "\\(a*\\)\\{%d\\}b", n);
+      if (re_compile_checked(pattern, RE_FLAG_NONE, storage, &size, &regex) ==
+          RE_STATUS_OK) {
+        if (re_exec(regex, "b", 0, &res) != RE_STATUS_OK ||
+            res.spans[0].start != 0 || res.spans[0].end != 1 ||
+            res.spans[1].start != 0 || res.spans[1].end != 0) {
+          fprintf(stderr, "FAIL: \"%s\" on \"b\" did not match [0, 1)\n",
+                  pattern);
+          failed++;
+        }
+      } else {
+        fprintf(stderr, "FAIL: could not compile \"%s\"\n", pattern);
+        failed++;
+      }
+    }
+  }
+
+  /* An unbounded quantifier past the ceiling: the answer used to be a
+   * match 256 characters long where Emacs reports 300. */
+  {
+    unsigned size = sizeof(storage);
+    re_t regex = NULL;
+    re_match_result res;
+
+    memset(subject, 'a', 300);
+    subject[300] = '\0';
+    if (re_compile_checked("\\(a\\)*", RE_FLAG_NONE, storage, &size, &regex) ==
+        RE_STATUS_OK) {
+      if (re_exec(regex, subject, 0, &res) != RE_STATUS_TOO_COMPLEX) {
+        fprintf(stderr,
+                "FAIL: \"\\(a\\)*\" over 300 a's answered [%d, %d) instead of "
+                "reporting the ceiling\n",
+                res.spans[0].start, res.spans[0].end);
+        failed++;
+      }
+      subject[200] = '\0';
+      if (re_exec(regex, subject, 0, &res) != RE_STATUS_OK ||
+          res.spans[0].end != 200) {
+        fprintf(stderr, "FAIL: \"\\(a\\)*\" over 200 a's did not match all "
+                        "of them\n");
+        failed++;
+      }
+    }
+  }
+
+  return failed;
+}
+
 int main(void) {
   int failed = 0;
 
@@ -1241,6 +1372,7 @@ int main(void) {
   }
 
   failed += test_execution_state();
+  failed += test_group_repeat_ceiling();
 
   printf("%d/%d tests succeeded.\n", failed == 0, 1);
   return failed ? 1 : 0;
