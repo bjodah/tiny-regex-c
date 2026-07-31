@@ -37,7 +37,13 @@ struct compile_case {
   re_status status;
 };
 
+/* How many individual cases this run put through the engine.  The summary
+ * used to read "1/1 tests succeeded" whatever happened above it, which is
+ * the one number a test program must not make up. */
+static unsigned long cases_run;
+
 static int check_compile(const struct compile_case* c) {
+  cases_run++;
   _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[512];
   unsigned size = sizeof(storage);
   re_t regex = NULL;
@@ -53,6 +59,7 @@ static int check_compile(const struct compile_case* c) {
 
 /* Run one span_case and report how many checks it failed. */
 static int check_spans(const struct span_case* c) {
+  cases_run++;
   _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
   unsigned size = sizeof(storage);
   re_t regex = NULL;
@@ -190,6 +197,9 @@ static int run_racers(struct racer* a, struct racer* b) {
   pthread_join(ta, NULL);
   pthread_join(tb, NULL);
   pthread_barrier_destroy(&racers_start);
+  /* Counted here, not in race(): the racers run concurrently and
+   * cases_run is an ordinary global. */
+  cases_run += (unsigned long)a->rounds + (unsigned long)b->rounds;
   return a->failed + b->failed;
 }
 #endif
@@ -395,6 +405,7 @@ static int test_group_repeat_ceiling(void) {
 
     for (i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
       unsigned size = sizeof(storage);
+      cases_run++;
       re_t regex = NULL;
       re_match_result res;
       re_status status;
@@ -1438,6 +1449,6 @@ int main(void) {
   failed += test_execution_state();
   failed += test_group_repeat_ceiling();
 
-  printf("%d/%d tests succeeded.\n", failed == 0, 1);
+  printf("%lu case(s) executed, %d check(s) failed.\n", cases_run, failed);
   return failed ? 1 : 0;
 }
