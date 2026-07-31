@@ -144,12 +144,20 @@ accepted language is an exact subset. Rejected, all as in Emacs:
   literal characters it is spelled with;
 - a `\` at the end of the pattern.
 
-Rejected where Emacs instead folds the two quantifiers into one: a
-quantifier on an atom that already carries one (`a++`, `a\{2\}\{3\}`,
-`a*?`). The composition has no faithful spelling here -- `a\{2\}\{2,3\}`
-is 4 or 6 repetitions, not 4 to 6 -- and it used to compile a node the
-matcher could only ever fail on. A quantifier on a *group* is ordinary:
-`\(a\)*` is fine.
+Rejected because there is nowhere to report the answer: a tenth capture
+group. `re_match_result` carries `RE_MAX_SPANS` spans, the whole match
+plus nine groups, so a tenth `\(` is refused rather than compiled into a
+group whose span nothing can hold. Emacs has no such limit.
+
+Rejected where Emacs reads the second quantifier as something this
+library does not have: a quantifier on an atom that already carries one.
+Emacs folds `a++`, `a**`, `a?*` and `a\{2\}\{3\}` into one greedy
+repetition, and the composition has no faithful spelling here --
+`a\{2\}\{2,3\}` is 4 or 6 repetitions, not 4 to 6. A `?` after a
+quantifier is Emacs' non-greedy operator instead (`a*?`, `a+?`, `??`),
+which this library does not have at all. Either way the pattern used to
+compile a node the matcher could only ever fail on. A quantifier on a
+*group* is ordinary: `\(a\)*` is fine.
 
 Where there is nothing to repeat -- the start of the pattern, of a group
 or of an alternative, and just after an anchor -- `*`, `+`, `?` and `\{`
@@ -176,6 +184,13 @@ report a plain no-match and `\(a\)*` over 300 `a`s used to answer with a
 empty is the exception, and matches Emacs: it can satisfy any minimum
 count, so `\(a*\)\{300\}` matches the empty string. Counts on a single
 atom (`a\{300\}`) are not affected -- no group is expanded.
+
+Abandoning is abandoning the whole attempt, not just the branch that ran
+out: the alternatives still untried and the start positions not yet swept
+go with it. `\(a\)\{300\}\|b` over 256 `a`s and a `b` therefore answers
+`RE_STATUS_TOO_COMPLEX`, where Emacs reports the `b`. That is the
+conservative direction -- the library never says a subject does not match
+when it stopped looking.
 
 `re_exec_with_options()` sets those bounds per call, and can pass a
 `cancel` callback that the matcher polls and obeys:

@@ -1186,6 +1186,70 @@ int main(void) {
         failed += check_spans(&cases[i]);
     }
 
+    /* Test 13d: the capture-group ceiling is part of the accepted
+     * language, not something that happens later.  re_match_result holds
+     * RE_MAX_SPANS spans -- the whole match plus nine groups -- so a tenth
+     * "\(" is refused at compile time rather than compiled into a group
+     * whose span nothing can report.  Emacs accepts all of these; this is
+     * one of the documented acceptance differences. */
+    {
+      _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[512];
+      unsigned n;
+      for (n = 1; n <= RE_MAX_SPANS + 1; n++) {
+        const re_status want =
+            n < RE_MAX_SPANS ? RE_STATUS_OK : RE_STATUS_BAD_PATTERN;
+        char flat[128];
+        char nested[128];
+        char subject[32];
+        struct compile_case cases[2];
+        unsigned size = sizeof(storage);
+        re_t regex = NULL;
+        re_match_result res;
+        unsigned i;
+
+        for (i = 0; i < n; i++) {
+          memcpy(flat + i * 5, "\\(a\\)", 5);
+          memcpy(nested + i * 2, "\\(", 2);
+          memcpy(nested + n * 2 + 1 + i * 2, "\\)", 2);
+          subject[i] = 'a';
+        }
+        flat[n * 5] = '\0';
+        nested[n * 2] = 'a';
+        nested[n * 4 + 1] = '\0';
+        subject[n] = '\0';
+
+        cases[0].pattern = flat;
+        cases[1].pattern = nested;
+        cases[0].status = cases[1].status = want;
+        failed += check_compile(&cases[0]);
+        failed += check_compile(&cases[1]);
+        if (want != RE_STATUS_OK)
+          continue;
+
+        /* Every group an accepted pattern declares gets its own span. */
+        if (re_compile_checked(flat, RE_FLAG_NONE, storage, &size, &regex) !=
+                RE_STATUS_OK ||
+            re_exec(regex, subject, 0, &res) != RE_STATUS_OK) {
+          fprintf(stderr, "FAIL: \"%s\" did not match \"%s\"\n", flat, subject);
+          failed++;
+          continue;
+        }
+        if (res.nspans != (int)n + 1) {
+          fprintf(stderr, "FAIL: \"%s\" reported %d spans, expected %u\n", flat,
+                  res.nspans, n + 1);
+          failed++;
+          continue;
+        }
+        for (i = 1; i <= n; i++) {
+          if (res.spans[i].start == (int)i - 1 && res.spans[i].end == (int)i)
+            continue;
+          fprintf(stderr, "FAIL: \"%s\" group %u is [%d,%d), expected [%u,%u)\n",
+                  flat, i, res.spans[i].start, res.spans[i].end, i - 1, i);
+          failed++;
+        }
+      }
+    }
+
     /* Test 14: the caller-storage alignment contract.
      *
      * A compiled program is read in place through the private node type,

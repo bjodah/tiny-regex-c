@@ -67,13 +67,25 @@
  *     interval (see '\{n,m\}' above);
  *   - a '\' at the end of the pattern.
  *
- * Rejected, where Emacs instead folds the two quantifiers into one:
+ * Rejected because this engine has no way to report the answer:
  *
- *   - a quantifier on an atom that already carries one ('a++',
- *     'a\{2\}\{3\}', 'a*?').  The composition has no faithful spelling
- *     here -- 'a\{2\}\{2,3\}' is 4 or 6 repetitions, not 4 to 6 -- and
- *     this used to compile a node that could never match.  Note that a
- *     quantifier on a *group* is ordinary: '\(a\)*' is fine.
+ *   - a tenth capture group.  re_match_result carries RE_MAX_SPANS spans,
+ *     which is the whole match plus nine groups, so a tenth '\(' is
+ *     refused rather than compiled into a group whose span nothing can
+ *     hold.  Emacs has no such limit.
+ *
+ * Rejected, where Emacs reads the second quantifier as something this
+ * engine does not have:
+ *
+ *   - a quantifier on an atom that already carries one.  Emacs folds
+ *     'a++', 'a**', 'a?*' and 'a\{2\}\{3\}' into one greedy repetition,
+ *     and there is no faithful spelling for that composition here --
+ *     'a\{2\}\{2,3\}' is 4 or 6 repetitions, not 4 to 6.  A '?' after a
+ *     quantifier is Emacs' non-greedy operator instead ('a*?', 'a+?',
+ *     '??'), which this engine does not have at all.  Either way the
+ *     pattern used to compile into a node that could never match, and
+ *     saying so is better.  Note that a quantifier on a *group* is
+ *     ordinary: '\(a\)*' is fine.
  *
  * Accepted as the literal character, as in Emacs: '*', '+', '?' and '\{'
  * where there is nothing to repeat -- the start of the pattern, of a group
@@ -197,6 +209,14 @@ re_status re_exec(re_t regex,
  * a match 256 characters long.  A group whose body matches empty still
  * satisfies any minimum count, as it does in Emacs, and a count on a
  * single atom ('a\{300\}') expands no group at all.
+ *
+ * "Abandoned" is the whole attempt, not the branch that ran out: the
+ * alternatives still untried and the start positions not yet swept are
+ * abandoned with it.  A subject that does contain a match elsewhere
+ * therefore answers TOO_COMPLEX as well -- '\(a\)\{300\}\|b' over 256
+ * 'a's and a 'b', where Emacs reports the 'b'.  That is the conservative
+ * direction: the engine never says a subject does not match when it
+ * stopped looking.
  */
 typedef struct {
   unsigned long max_steps;

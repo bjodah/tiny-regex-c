@@ -48,6 +48,15 @@ clean:
 	@rm -f a.out
 	@rm -f *.o
 
+# Read what these two actually run before adding a row to ok.lst or
+# nok.lst. Both drivers stop at the first pattern that repeats the one
+# above it -- ok.lst:17 and nok.lst:15 -- and their repeat budget is one
+# counter for the whole file, not per pattern, so the first pattern
+# consumes it all. Everything below those lines has never been executed.
+# They also compare against *Python's* re, which reads Emacs' escaped
+# operators as literals, so most of this dialect could not be checked here
+# even if they did run. tests/test1.c, tests/test_compile.c and
+# tests/test_api.c are where a new case belongs.
 test-pyok: tests/test_rand
 	@$(test $(PYTHON))
 	@$(PYTHON) ./scripts/regex_test.py tests/ok.lst $(NRAND_TESTS)
