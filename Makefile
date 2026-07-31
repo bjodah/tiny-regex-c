@@ -20,7 +20,8 @@ PYTHON != if (python --version 2>&1 | grep -q 'Python 3\..*'); then \
             echo 'Error: no compatible python 3 version found.' >&2;  \
             exit 1;                                                 \
           fi
-TEST_BINS = tests/test1 tests/test2 tests/test_compile tests/test_rand tests/test_rand_neg tests/test_api
+TEST_BINS = tests/test1 tests/test2 tests/test_compile tests/test_rand \
+            tests/test_rand_neg tests/test_api tests/test_end_anchor
 
 all: $(TEST_BINS)
 
@@ -42,6 +43,8 @@ TEST_PTHREAD_FLAGS ?= -DRE_TEST_PTHREADS -D_POSIX_C_SOURCE=200809L -pthread
 
 tests/test_api: re.c tests/test_api.c
 	@$(CC) -I. $(CFLAGS) $(TEST_PTHREAD_FLAGS) re.c tests/test_api.c -o $@
+tests/test_end_anchor: re.c tests/test_end_anchor.c
+	@$(CC) -I. $(CFLAGS) re.c tests/test_end_anchor.c -o $@
 
 clean:
 	@rm -f $(TEST_BINS)
@@ -73,6 +76,7 @@ test: all verify-syntax
 	$(TEST_RUNNER) ./tests/test_compile
 	$(TEST_RUNNER) ./tests/test2
 	$(TEST_RUNNER) ./tests/test_api
+	$(TEST_RUNNER) ./tests/test_end_anchor
 
 check: test
 
