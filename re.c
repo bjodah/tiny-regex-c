@@ -40,6 +40,7 @@
 #include "re.h"
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #ifdef _UNICODE
@@ -156,6 +157,18 @@ typedef struct regex_t {
     };
   } u;
 } regex_t;
+
+/* RE_STORAGE_ALIGNMENT is the public spelling of what caller storage has to
+ * satisfy for the nodes above to be read in place; the two must not drift. */
+_Static_assert(_Alignof(regex_t) == RE_STORAGE_ALIGNMENT,
+               "RE_STORAGE_ALIGNMENT must equal _Alignof(regex_t)");
+
+/* Whether 'storage' may hold a compiled program.  Casting an insufficiently
+ * aligned buffer to regex_t* and reading through it is undefined behavior
+ * (and UBSan reports it), so the compilers refuse the buffer instead. */
+static int storage_aligned(const void* storage) {
+  return !((uintptr_t)storage % RE_STORAGE_ALIGNMENT);
+}
 
 /*
  * Character-class (and inline) data is stored as a trailing string that
@@ -367,8 +380,11 @@ re_status re_compile_checked(const char* pattern,
   if (!pattern || !storage_size) {
     return RE_STATUS_BAD_PATTERN;
   }
+  if (storage && !storage_aligned(storage)) {
+    return RE_STATUS_BAD_PATTERN;
+  }
 
-  unsigned char temp_buffer[RE_MAX_COMPILED_BYTES];
+  _Alignas(regex_t) unsigned char temp_buffer[RE_MAX_COMPILED_BYTES];
   unsigned temp_size = sizeof(temp_buffer);
   re_t compiled = re_compile_to(pattern, temp_buffer, &temp_size);
   if (!compiled) {
@@ -582,6 +598,8 @@ static int quantifiable(unsigned char* re_data, int j) {
 re_t re_compile_to(const char* pattern,
                    unsigned char* re_data,
                    unsigned* size) {
+  if (!storage_aligned(re_data))
+    return 0;
   memset(re_data, 0, *size);
 
   int i = 0; /* index into pattern        */
@@ -846,7 +864,8 @@ re_t re_compile_to(const char* pattern,
 }
 
 re_t re_compile(const char* pattern) {
-  static unsigned char buffer[MAX_REGEXP_OBJECTS * sizeof(regex_t)];
+  static _Alignas(
+      regex_t) unsigned char buffer[MAX_REGEXP_OBJECTS * sizeof(regex_t)];
   unsigned size = sizeof(buffer);
   re_t out = NULL;
   re_status status =

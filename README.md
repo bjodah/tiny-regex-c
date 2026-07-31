@@ -140,6 +140,27 @@ alternative -- `\{` is the literal `{`, as in Emacs.
 `start_offset`: that argument says where to resume scanning, so a
 `^`-anchored pattern cannot match at a non-zero offset.
 
+### Caller-supplied storage
+`re_compile_checked()` and `re_compile_to()` compile into a buffer the
+caller owns. A compiled program is not an opaque byte string -- the engine
+reads its multi-byte fields in place -- so that buffer must be aligned to
+`RE_STORAGE_ALIGNMENT`:
+
+```C
+alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[RE_MAX_COMPILED_BYTES];
+```
+
+Anything `malloc()` returns is aligned enough; a bare `unsigned char`
+array or an interior pointer into one need not be. Storage that is not
+aligned is **refused** rather than written to and read back through:
+`re_compile_checked()` returns `RE_STATUS_BAD_PATTERN` and
+`re_compile_to()` returns `NULL`.
+
+Passing `NULL` storage with `*storage_size == 0` to
+`re_compile_checked()` is the supported way to ask how many bytes the
+pattern needs; it reports `RE_STATUS_BUFFER_TOO_SMALL` and writes the
+required size.
+
 ### Usage
 Compile a regex from ASCII-string (char-array) to a custom pattern structure using `re_compile()`.
 

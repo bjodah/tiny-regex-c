@@ -105,9 +105,26 @@ typedef struct {
 
 #define RE_MAX_COMPILED_BYTES 8192
 
+/* Alignment every caller-supplied storage buffer must satisfy.
+ *
+ * A compiled program is not an opaque byte string: the engine reads its
+ * multi-byte fields in place through `struct regex_t`, so storage that is
+ * not aligned for that type cannot be used without undefined behavior.
+ * Rather than read it anyway, the compilers refuse such a buffer --
+ * re_compile_checked() returns RE_STATUS_BAD_PATTERN and re_compile_to()
+ * returns NULL, neither of them writing to it.
+ *
+ * Anything malloc() returns satisfies this, as does any object declared
+ * `alignas(RE_STORAGE_ALIGNMENT)` or with a stricter alignment.  A
+ * `char`/`unsigned char` array with no alignment specifier does not, and
+ * neither does an interior pointer into one. */
+#define RE_STORAGE_ALIGNMENT 2u
+
 /* Checked compile and execute APIs.  On RE_STATUS_BUFFER_TOO_SMALL,
  * *storage_size is set to the required byte count.  Passing NULL storage with
- * *storage_size == 0 is the supported way to query that size. */
+ * *storage_size == 0 is the supported way to query that size.  `storage` must
+ * be aligned to RE_STORAGE_ALIGNMENT; if it is not, the call fails with
+ * RE_STATUS_BAD_PATTERN without touching the buffer. */
 re_status re_compile_checked(const char* pattern,
                              re_flags flags,
                              unsigned char* storage,
@@ -127,7 +144,9 @@ re_status re_exec(re_t regex,
                   int start_offset,
                   re_match_result* out);
 
-/* Compile regex string pattern to custom buffer, returning # of bytes used */
+/* Compile regex string pattern to custom buffer, returning # of bytes used.
+ * `re_data` must be aligned to RE_STORAGE_ALIGNMENT; a buffer that is not is
+ * rejected (NULL return) rather than written to. */
 re_t re_compile_to(const char* pattern,
                    unsigned char* re_data,
                    unsigned* bytes);

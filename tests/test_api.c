@@ -29,7 +29,7 @@ struct compile_case {
 };
 
 static int check_compile(const struct compile_case* c) {
-  unsigned char storage[512];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[512];
   unsigned size = sizeof(storage);
   re_t regex = NULL;
   re_status status =
@@ -44,7 +44,7 @@ static int check_compile(const struct compile_case* c) {
 
 /* Run one span_case and report how many checks it failed. */
 static int check_spans(const struct span_case* c) {
-  unsigned char storage[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
   unsigned size = sizeof(storage);
   re_t regex = NULL;
   re_match_result res;
@@ -99,7 +99,7 @@ static int check_spans(const struct span_case* c) {
 int main(void) {
   int failed = 0;
 
-  unsigned char buf1[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char buf1[256];
   unsigned size1 = sizeof(buf1);
   re_t p1 = re_compile_to("a[0-9]+", buf1, &size1);
   if (!p1 || size1 == 0) {
@@ -113,7 +113,7 @@ int main(void) {
     failed++;
   }
 
-  unsigned char buf2[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char buf2[256];
   unsigned size2 = sizeof(buf2);
   re_t p2 = re_compile_to("a[0-9]+", buf2, &size2);
   if (re_compare(p1, p2) != 0) {
@@ -121,7 +121,7 @@ int main(void) {
     failed++;
   }
 
-  unsigned char buf3[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char buf3[256];
   unsigned size3 = sizeof(buf3);
   re_t p3 = re_compile_to("b[0-9]+", buf3, &size3);
   if (re_compare(p1, p3) == 0) {
@@ -129,7 +129,7 @@ int main(void) {
     failed++;
   }
 
-  unsigned char buf4[256];
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char buf4[256];
   unsigned size4 = sizeof(buf4);
   re_t p4 = re_compile_to("a[0-9]+longer", buf4, &size4);
   if (re_compare(p1, p4) == 0) {
@@ -157,7 +157,7 @@ int main(void) {
   /* Checked API tests */
   {
     /* Test 1: Compile valid pattern */
-    unsigned char storage[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
     unsigned storage_size = sizeof(storage);
     re_t regex = NULL;
     re_status status = re_compile_checked("a[0-9]+", RE_FLAG_NONE, storage,
@@ -175,7 +175,7 @@ int main(void) {
     }
 
     /* Test 2: Compile invalid pattern */
-    unsigned char storage_invalid[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage_invalid[256];
     unsigned storage_size_invalid = sizeof(storage_invalid);
     re_t regex_invalid = NULL;
     status = re_compile_checked("\\", RE_FLAG_NONE, storage_invalid,
@@ -190,7 +190,7 @@ int main(void) {
 
     /* Test 3: Buffer too small handling and storage_size updating */
     unsigned storage_size_small = 5; /* way too small */
-    unsigned char storage_small[5];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage_small[5];
     re_t regex_small = NULL;
     status = re_compile_checked("a[0-9]+", RE_FLAG_NONE, storage_small,
                                 &storage_size_small, &regex_small);
@@ -267,7 +267,7 @@ int main(void) {
     }
 
     /* Test 6: Zero-length matches */
-    unsigned char z_storage[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char z_storage[256];
     unsigned z_size = sizeof(z_storage);
     re_t z_regex = NULL;
     status =
@@ -322,7 +322,7 @@ int main(void) {
     }
 
     /* Test 7: POSIX bracket classes */
-    unsigned char posix_storage[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char posix_storage[256];
     unsigned posix_size = sizeof(posix_storage);
     re_t posix_regex = NULL;
     status = re_compile_checked("[[:digit:]]+", RE_FLAG_NONE, posix_storage,
@@ -351,7 +351,7 @@ int main(void) {
     }
 
     /* Test 8: Bare vs Escaped constructs (Emacs-like dialect) */
-    unsigned char dialect_storage[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char dialect_storage[256];
     unsigned dialect_size = sizeof(dialect_storage);
     re_t dialect_regex = NULL;
     /* bare ( ) and | should be literal characters, not grouping or alternation
@@ -379,7 +379,7 @@ int main(void) {
     }
 
     /* Test 9: Case Folding (RE_FLAG_ICASE) */
-    unsigned char icase_storage[256];
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char icase_storage[256];
     unsigned icase_size = sizeof(icase_storage);
     re_t icase_regex = NULL;
     status = re_compile_checked("aB[c-e]F", RE_FLAG_ICASE, icase_storage,
@@ -406,7 +406,7 @@ int main(void) {
     /* Test 10: Nested groups, optional unmatched groups, and repeated captures
      */
     {
-      unsigned char test10_storage[256];
+      _Alignas(RE_STORAGE_ALIGNMENT) unsigned char test10_storage[256];
       unsigned test10_size = sizeof(test10_storage);
       re_t test10_regex = NULL;
       status = re_compile_checked("\\(a\\(b\\)?c\\)+", RE_FLAG_NONE,
@@ -699,6 +699,100 @@ int main(void) {
       size_t i;
       for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
         failed += check_compile(&cases[i]);
+    }
+
+    /* Test 14: the caller-storage alignment contract.
+     *
+     * A compiled program is read in place through the private node type,
+     * so storage that is not RE_STORAGE_ALIGNMENT-aligned has to be
+     * refused.  Compiling into it and executing from it used to be
+     * undefined behavior that UBSan reports inside re_exec(). */
+    {
+      static _Alignas(RE_STORAGE_ALIGNMENT) unsigned char raw[512];
+      const char* pat = "\\(a\\)b";
+      int round;
+
+      unsigned odd_size = sizeof(raw) - 1;
+      re_t odd_regex = (re_t)(void*)raw; /* must be cleared */
+      status =
+          re_compile_checked(pat, RE_FLAG_NONE, raw + 1, &odd_size, &odd_regex);
+      if (status != RE_STATUS_BAD_PATTERN) {
+        fprintf(stderr,
+                "FAIL: re_compile_checked into misaligned storage expected "
+                "BAD_PATTERN, got %d\n",
+                status);
+        failed++;
+      }
+      if (odd_regex) {
+        fprintf(stderr,
+                "FAIL: re_compile_checked into misaligned storage left a "
+                "non-NULL regex\n");
+        failed++;
+      }
+
+      unsigned odd_to_size = sizeof(raw) - 1;
+      if (re_compile_to(pat, raw + 1, &odd_to_size)) {
+        fprintf(stderr,
+                "FAIL: re_compile_to into misaligned storage compiled "
+                "anyway\n");
+        failed++;
+      }
+
+      /* Aligned storage still works, twice into the same buffer. */
+      for (round = 0; round < 2; round++) {
+        unsigned even_size = sizeof(raw) - 2;
+        re_t even_regex = NULL;
+        re_match_result res;
+
+        status = re_compile_checked(pat, RE_FLAG_NONE, raw + 2, &even_size,
+                                    &even_regex);
+        if (status != RE_STATUS_OK || !even_regex) {
+          fprintf(stderr,
+                  "FAIL: re_compile_checked into aligned storage (round %d) "
+                  "returned %d\n",
+                  round, status);
+          failed++;
+          continue;
+        }
+        status = re_exec(even_regex, "xab", 0, &res);
+        if (status != RE_STATUS_OK || res.spans[0].start != 1 ||
+            res.spans[0].end != 3 || res.spans[1].start != 1 ||
+            res.spans[1].end != 2) {
+          fprintf(stderr,
+                  "FAIL: re_exec from aligned storage (round %d): status %d, "
+                  "spans [%d, %d) [%d, %d)\n",
+                  round, status, res.spans[0].start, res.spans[0].end,
+                  res.spans[1].start, res.spans[1].end);
+          failed++;
+        }
+      }
+
+      /* NULL storage with *storage_size == 0 is the size query, and the
+       * size it reports is enough to compile into. */
+      unsigned query_size = 0;
+      re_t query_regex = NULL;
+      status =
+          re_compile_checked(pat, RE_FLAG_NONE, NULL, &query_size, &query_regex);
+      if (status != RE_STATUS_BUFFER_TOO_SMALL || query_size == 0 ||
+          query_regex) {
+        fprintf(stderr,
+                "FAIL: size query expected BUFFER_TOO_SMALL with a non-zero "
+                "size, got %d / %u\n",
+                status, query_size);
+        failed++;
+      } else {
+        unsigned exact_size = query_size;
+        re_t exact_regex = NULL;
+        status = re_compile_checked(pat, RE_FLAG_NONE, raw, &exact_size,
+                                    &exact_regex);
+        if (status != RE_STATUS_OK || exact_size != query_size) {
+          fprintf(stderr,
+                  "FAIL: compiling into the queried size returned %d (%u vs "
+                  "%u)\n",
+                  status, exact_size, query_size);
+          failed++;
+        }
+      }
     }
   }
 
