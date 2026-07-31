@@ -1841,52 +1841,50 @@ static int re_matchp_internal(re_t pattern,
 #ifdef CPROVER
 #define N 24
 
-/* Formal verification with cbmc: */
-/* cbmc -DCPROVER --64 --depth 200 --bounds-check --pointer-check
- * --memory-leak-check --div-by-zero-check --signed-overflow-check
- * --unsigned-overflow-check --pointer-overflow-check --conversion-check
- * --undefined-shift-check --enum-range-check --pointer-primitive-check -trace
- * re.c
- */
+/* Formal verification with cbmc: `make verify`, which runs one proof per
+ * harness below.  This block had rotted -- it called a re_match() whose
+ * first parameter became a pattern string, read a union member (u.ccl)
+ * that no longer exists, and used a bare assume() that is not a CBMC
+ * builtin -- so `make verify` had not compiled, let alone verified,
+ * for as long as the node layout has looked like this.  `make
+ * verify-syntax` is what keeps that from happening again: it type-checks
+ * this block with an ordinary compiler on every `make check`. */
+#ifdef __CPROVER
+#define ASSUME(x) __CPROVER_assume(x)
+#else
+/* Not building under cbmc: keep the harness compilable so its rot is
+ * caught by a compiler rather than by whoever next installs cbmc. */
+#define ASSUME(x) ((void)(x))
+#endif
 
-void verify_re_compile() {
-  /* test input - ten chars used as a regex-pattern input */
+void verify_re_compile(void);
+void verify_re_match(void);
+
+void verify_re_compile(void) {
+  /* test input - N chars used as a regex-pattern input */
   char arr[N];
-  /* make input symbolic, to search all paths through the code */
-  /* i.e. the input is checked for all possible ten-char combinations */
-  for (int i = 0; i < sizeof(arr) - 1; i++) {
-    // arr[i] = nondet_char();
-    assume(arr[i] > -127 && arr[i] < 128);
-  }
-  /* assume proper NULL termination */
-  assume(arr[sizeof(arr) - 1] == 0);
+  /* the array is uninitialized, which is what makes it symbolic: cbmc
+   * searches every value it could hold.  The original per-byte range
+   * assumption is gone: on an 8-bit char it excluded nothing, and it
+   * made every compiler that is not cbmc warn about a tautology. */
+  ASSUME(arr[sizeof(arr) - 1] == 0); /* proper NUL termination */
   /* verify abscence of run-time errors - go! */
   re_compile(arr);
 }
 
-void verify_re_match() {
+void verify_re_match(void) {
   int length;
   regex_t pattern[MAX_REGEXP_OBJECTS];
   char arr[N];
 
   for (unsigned char i = 0; i < MAX_REGEXP_OBJECTS; i++) {
-    // pattern[i].type = nondet_uchar();
-    // pattern[i].u.ch = nondet_int();
-    assume(pattern[i].type >= 0 && pattern[i].type <= 255);
-    assume(pattern[i].u.ccl >= 0 && pattern[i].u.ccl <= ~1);
+    ASSUME(pattern[i].type <= TIMES_NM);
+    ASSUME(pattern[i].u.n <= 0xFFFF);
   }
-  for (int i = 0; i < sizeof(arr) - 1; i++) {
-    assume(arr[i] > -127 && arr[i] < 128);
-  }
-  /* assume proper NULL termination */
-  assume(arr[sizeof(arr) - 1] == 0);
+  ASSUME(arr[sizeof(arr) - 1] == 0); /* proper NUL termination */
 
-  re_match(&pattern, arr, &length);
-}
-
-int main(int argc, char* argv[]) {
-  verify_re_compile();
-  verify_re_match();
-  return 0;
+  /* re_match() takes a pattern string; the compiled-program entry point
+   * is re_matchp(), which is what this harness has always meant. */
+  re_matchp(pattern, arr, &length);
 }
 #endif

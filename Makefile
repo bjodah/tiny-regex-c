@@ -66,7 +66,7 @@ test-pynok: tests/test_rand_neg tests/pynok.lst
 pysubset:
 	@$(PYTHON) ./scripts/select_python_subset.py
 
-test: all
+test: all verify-syntax
 	$(TEST_RUNNER) ./tests/test1
 	$(MAKE) test-pyok
 	$(MAKE) test-pynok
@@ -76,12 +76,28 @@ test: all
 
 check: test
 
-CBMC := cbmc
-
-# unwindset: loop max MAX_REGEXP_OBJECTS patterns
-# --enum-range-check not with cbmc 5.10 on ubuntu-latest
+CBMC ?= cbmc
+CBMC_FLAGS ?= -DCPROVER --unwind 16 --depth 16 --bounds-check \
+	--pointer-check --memory-leak-check --div-by-zero-check \
+	--signed-overflow-check --unsigned-overflow-check \
+	--pointer-overflow-check --conversion-check --undefined-shift-check
+# --enum-range-check not with cbmc 5.10 on ubuntu-latest.
+# One proof per harness: re.c has no main() under -DCPROVER, so cbmc has
+# to be told its entry point, and the old recipe (no --function, and an
+# "--unwindset 8" that is missing the loop name the option takes) could
+# not have run even when the harness still compiled.
 verify:
-	$(CBMC) -DCPROVER --unwindset 8 --unwind 16 --depth 16 --bounds-check --pointer-check --memory-leak-check --div-by-zero-check --signed-overflow-check --unsigned-overflow-check --pointer-overflow-check --conversion-check --undefined-shift-check $(CBMC_ARGS) re.c
+	$(CBMC) $(CBMC_FLAGS) --function verify_re_compile $(CBMC_ARGS) re.c
+	$(CBMC) $(CBMC_FLAGS) --function verify_re_match $(CBMC_ARGS) re.c
+
+# What keeps the CPROVER harness from rotting on a machine without cbmc:
+# it is code, and an ordinary compiler can say whether it is still valid.
+# It had not compiled for a long time -- it called re_match() with a
+# compiled program, read a union member that no longer exists, and used a
+# bare assume().  Part of `make test`, costs a fraction of a second.
+VERIFY_SYNTAX_CC ?= $(CC)
+verify-syntax:
+	$(VERIFY_SYNTAX_CC) -DCPROVER -I. -Wall -Wextra -Werror -fsyntax-only re.c
 
 # Project metrics
 SCC ?= scc
@@ -211,6 +227,6 @@ fuzz-smoke: $(FUZZ_BIN)
 fuzz-clean:
 	rm -rf $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR) $(FUZZ_BIN)
 
-.PHONY: all clean test-pyok test-pynok pysubset test check verify complexity \
+.PHONY: all clean test-pyok test-pynok pysubset test check verify verify-syntax complexity \
 	complexity-check pmccabe pmccabe-check coverage coverage-clean \
 	format format-check compile-db iwyu fuzz fuzz-smoke fuzz-clean
