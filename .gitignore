@@ -3,6 +3,10 @@
 .gdbinit
 /tests/*
 !/tests/*.c
+# The pattern lists are inputs, not build products: tests/test1.c reads
+# ok.lst and nok.lst, and the scripts/ drivers read the generated
+# pyok.lst and pynok.lst subsets.
+!/tests/*.lst
 *.o
 *.gcda
 *.gcno

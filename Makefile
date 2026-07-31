@@ -48,22 +48,23 @@ clean:
 	@rm -f a.out
 	@rm -f *.o
 
-# Read what these two actually run before adding a row to ok.lst or
-# nok.lst. Both drivers stop at the first pattern that repeats the one
-# above it -- ok.lst:17 and nok.lst:15 -- and their repeat budget is one
-# counter for the whole file, not per pattern, so the first pattern
-# consumes it all. Everything below those lines has never been executed.
-# They also compare against *Python's* re, which reads Emacs' escaped
-# operators as literals, so most of this dialect could not be checked here
-# even if they did run. tests/test1.c, tests/test_compile.c and
-# tests/test_api.c are where a new case belongs.
-test-pyok: tests/test_rand
-	@$(test $(PYTHON))
-	@$(PYTHON) ./scripts/regex_test.py tests/ok.lst $(NRAND_TESTS)
+# These two compare against *Python's* re, which reads this dialect's
+# escaped operators ("\\(", "\\|", "\\{") as literals, so they run the
+# generated Python-compatible subsets rather than ok.lst/nok.lst
+# themselves. Add a row to tests/ok.lst or tests/nok.lst -- tests/test1.c
+# executes every one of them -- and run `make pysubset` to let the row
+# into these drivers if both dialects agree on it.
+test-pyok: tests/test_rand tests/pyok.lst
+	@$(PYTHON) ./scripts/regex_test.py tests/pyok.lst $(NRAND_TESTS)
 
-test-pynok: tests/test_rand_neg
-	@$(test $(PYTHON))
-	@$(PYTHON) ./scripts/regex_test_neg.py tests/nok.lst $(NRAND_TESTS)
+test-pynok: tests/test_rand_neg tests/pynok.lst
+	@$(PYTHON) ./scripts/regex_test_neg.py tests/pynok.lst $(NRAND_TESTS)
+
+# Regenerate those subsets from ok.lst/nok.lst. Checked in, because the
+# drivers must not silently start testing a different set of rows than
+# the one that was reviewed.
+pysubset:
+	@$(PYTHON) ./scripts/select_python_subset.py
 
 test: all
 	$(TEST_RUNNER) ./tests/test1
@@ -210,6 +211,6 @@ fuzz-smoke: $(FUZZ_BIN)
 fuzz-clean:
 	rm -rf $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR) $(FUZZ_BIN)
 
-.PHONY: all clean test-pyok test-pynok test check verify complexity \
+.PHONY: all clean test-pyok test-pynok pysubset test check verify complexity \
 	complexity-check pmccabe pmccabe-check coverage coverage-clean \
 	format format-check compile-db iwyu fuzz fuzz-smoke fuzz-clean

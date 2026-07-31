@@ -1,80 +1,105 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
+"""Random positive testing against Python's own matcher.
+
+For every pattern in the given file this generates random subjects that
+Python's `re` accepts (via the vendored exrex) and asserts that
+tests/test_rand accepts them too.
+
+The list this reads has to be a *Python-compatible* subset. tests/ok.lst
+is the Emacs dialect this engine implements, where "\\(", "\\|" and "\\{"
+are operators that Python reads as literals; those rows are checked by
+tests/test1.c, which runs every row of ok.lst and nok.lst. This driver
+reads tests/pyok.lst: the rows on which both dialects agree, machine
+selected by comparing Python's leftmost match length with the length
+recorded in ok.lst.
+
+History, because it explains why the row count moves so much here: this
+script used to stop at the first pattern equal to the one above it
+(ok.lst:17), and its repeat budget was one counter for the whole file
+rather than per pattern, so the first pattern consumed all of it and
+every later pattern ran zero subjects. It also wrapped both arguments in
+literal double quotes before handing them to the C program, so what got
+matched was "\\d" against "5", quotes included -- and it exited 0 no
+matter how many subjects failed.
 """
-  This python program generates random text that matches a given regex-pattern.
-  The patterns are given via sys.argv and the generated text is passed to
-  the binary 'tests/test_rand' to check if the generated text also matches
-  the regex-pattern in the C implementation.
-  The exit-code of the testing program, is used to determine test success.
 
-  This script is called by the Makefile when doing 'make test'
-"""
-
-
-import re
+import subprocess
 import sys
+
 import exrex
-from subprocess import call
+
+PROG = "./tests/test_rand"
 
 
-prog = "./tests/test_rand"
+def unquote(text):
+	"""The list files spell a newline as the two characters "\\n".
 
-if len(sys.argv) < 2:
-  print("")
-  print("usage: %s pattern-file [ntests or 10] [repeat]" % sys.argv[0])
-  print("")
-  sys.exit(-1)
+	tests/test1.c does this same conversion before handing a row to the
+	engine (cunquote()), and Python reads "\\n" in a pattern as a newline
+	too, so both sides have to see the converted form or they are not
+	being asked the same question.
+	"""
+	return (text.replace("\\n", "\n").replace("\\t", "\t")
+		.replace("\\r", "\r"))
 
-own_prog = sys.argv[0]
-pattern_file = sys.argv[1]
-if len(sys.argv) > 2:
-  ntests = int(sys.argv[2])
-else:
-  ntests = 10
-nfails = 0
-repeats = ntests
-old_pattern = ""
-if len(sys.argv) > 3:
-  repeats = int(sys.argv[3])
 
-sys.stdout.write("Testing patterns against %d random strings matching the Python implementation and comparing::\n" % ntests)
+def read_patterns(path):
+	patterns = []
+	with open(path, "rt", encoding="utf-8") as handle:
+		for line in handle:
+			if not line.strip() or line.startswith("#"):
+				continue
+			patterns.append(unquote(line.split("\t")[0]))
+	return patterns
 
-with open(pattern_file, 'rt') as f:
-  for line in f:
-    parts = line.split('\t')
-    pattern = parts[0]
-    if pattern == old_pattern:
-      break
-    old_pattern = pattern
-    r = 50
-    while r < 0:
-      try:
-        g = exrex.generate(pattern)
-        break
-      except:
-        pass
-    
-    sys.stdout.write(" pattern '%s':\n" % pattern)
-    
-    while repeats > 0:
-      try:
-        repeats -= 1
-        example = exrex.getone(pattern)
-        print("%s \"%s\" \"%s\"" % (prog, pattern, example))
-        ret = call([prog, "\"%s\"" % pattern, "\"%s\"" % example])
-        if ret != 0:
-          escaped = repr(example) # escapes special chars for better printing
-          print("    FAIL : %s doesn't match %s as expected [%s]." % (pattern, escaped, ", ".join([("0x%02x" % ord(e)) for e in example]) ))
-          nfails += 1
-    
-      except:
-        #import traceback
-        #print("EXCEPTION!")
-        #raw_input(traceback.format_exc())
-        ntests -= 1
-        repeats = 0
-        #nfails += 1
 
-sys.stdout.write("%4d/%d tests succeeded.\n\n" % (ntests - nfails, ntests))
-#print("")
+def main(argv):
+	if len(argv) < 2:
+		print(f"\nusage: {argv[0]} pattern-file [total-subjects]\n")
+		return 2
 
+	path = argv[1]
+	total = int(argv[2]) if len(argv) > 2 else 10
+	patterns = read_patterns(path)
+	if not patterns:
+		print(f"FAIL: no patterns in {path}", file=sys.stderr)
+		return 1
+
+	# The budget is spread over the patterns instead of being spent on
+	# the first one, so the file costs what the Makefile asked for.
+	per_pattern = max(1, total // len(patterns))
+	checks = 0
+	failures = 0
+
+	print(f"Testing {len(patterns)} patterns from {path} against "
+	      f"{per_pattern} random matching subject(s) each:")
+	for pattern in patterns:
+		for _ in range(per_pattern):
+			try:
+				example = exrex.getone(pattern)
+			except Exception as exc:  # exrex cannot build this one
+				print(f"  SKIP  {pattern!r}: exrex: {exc}")
+				break
+			checks += 1
+			proc = subprocess.run([PROG, pattern, example])
+			if proc.returncode != 0:
+				octets = ", ".join("0x%02x" % b for b in
+						   example.encode("utf-8"))
+				print(f"  FAIL  {pattern!r} did not match "
+				      f"{example!r} [{octets}]")
+				failures += 1
+
+	print(f" {checks - failures}/{checks} subjects matched as expected.\n")
+	if failures:
+		print(f"FAIL: {failures} subject(s) rejected by {PROG}",
+		      file=sys.stderr)
+		return 1
+	if checks == 0:
+		print("FAIL: no subject was generated at all", file=sys.stderr)
+		return 1
+	return 0
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv))

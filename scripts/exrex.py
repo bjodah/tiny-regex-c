@@ -35,12 +35,27 @@ __all__ = ('generate', 'CATEGORIES', 'count', 'parse', 'getone')
 CATEGORIES = {'category_space'  : sorted(sre_parse.WHITESPACE)
              ,'category_digit'  : sorted(sre_parse.DIGITS)
              ,'category_not_digit'  : [chr(x) for x in range(32, 123) if
-                                       match('\D', chr(x))]
+                                       match(r'\D', chr(x))]
              ,'category_any'    : [chr(x) for x in range(32, 123)]
              ,'category_word'   : sorted( frozenset(string.ascii_letters + string.digits + "_") )
              ,'category_not_word'  : [chr(x) for x in range(32, 123) if
-                                       match('\W', chr(x))]
+                                       match(r'\W', chr(x))]
              }
+
+def _op(item):
+    """The opcode name of one parsed item, lowercased.
+
+    Python 3.11 moved sre_parse to re._parser and its opcodes are
+    _NamedIntConstant objects that str() as "LITERAL"; this module was
+    written when they compared equal to "literal". Without this every
+    expression fell through to "cannot handle expression".
+    """
+    return str(item[0]).lower()
+
+
+def _category(name):
+    return CATEGORIES.get(str(name).lower(), [''])
+
 
 def comb(g, i):
     for c in g:
@@ -56,7 +71,7 @@ def _in(d):
     ret = []
     neg = False
     for i in d:
-        if i[0] == 'range':
+        if _op(i) == 'range':
             subs = map(chr, range(i[1][0], i[1][1]+1))
             if neg:
                 for char in subs:
@@ -66,7 +81,7 @@ def _in(d):
                         pass
             else:
                 ret.extend(subs)
-        elif i[0] == 'literal':
+        elif _op(i) == 'literal':
             if neg:
                 try:
                     ret.remove(chr(i[1]))
@@ -74,8 +89,8 @@ def _in(d):
                     pass
             else:
                 ret.append(chr(i[1]))
-        elif i[0] == 'category':
-            subs = CATEGORIES.get(i[1], [''])
+        elif _op(i) == 'category':
+            subs = _category(i[1])
             if neg:
                 for char in subs:
                     try:
@@ -84,7 +99,7 @@ def _in(d):
                         pass
             else:
                 ret.extend(subs)
-        elif i[0] == 'negate':
+        elif _op(i) == 'negate':
             ret = list(CATEGORIES['category_any'])
             neg = True
     return ret
@@ -110,25 +125,25 @@ def _gen(d, limit=20, count=False):
     ret = ['']
     strings = 0
     for i in d:
-        if i[0] == 'in':
+        if _op(i) == 'in':
             subs = _in(i[1])
             if count:
                 strings = (strings or 1) * len(subs)
             ret = comb(ret, subs)
-        elif i[0] == 'literal':
+        elif _op(i) == 'literal':
             ret = mappend(ret, chr(i[1]))
-        elif i[0] == 'category':
-            subs = CATEGORIES.get(i[1], [''])
+        elif _op(i) == 'category':
+            subs = _category(i[1])
             if count:
                 strings = (strings or 1) * len(subs)
             ret = comb(ret, subs)
-        elif i[0] == 'any':
+        elif _op(i) == 'any':
             subs = CATEGORIES['category_any']
             if count:
                 strings = (strings or 1) * len(subs)
             ret = comb(ret, subs)
-        elif i[0] == 'max_repeat':
-            chars = filter(None, _gen(list(i[1][2]), limit))
+        elif _op(i) == 'max_repeat':
+            chars = [c for c in _gen(list(i[1][2]), limit) if c]
             if i[1][1]+1 - i[1][0] >= limit:
                 ran = range(i[1][0], i[1][0]+limit)
             else:
@@ -137,25 +152,25 @@ def _gen(d, limit=20, count=False):
                 for i in ran:
                     strings += pow(len(chars), i)
             ret = prods(ret, ran, chars)
-        elif i[0] == 'branch':
+        elif _op(i) == 'branch':
             subs = list(chain.from_iterable(_gen(list(x), limit) for x in i[1][1]))
             if count:
                 strings = (strings or 1) * (len(subs) or 1)
             ret = comb(ret, subs)
-        elif i[0] == 'subpattern':
+        elif _op(i) == 'subpattern':
             if count:
-                strings = (strings or 1) * (sum(ggen([0], _gen, i[1][1], limit=limit, count=True)) or 1)
-            ret = ggen(ret, _gen, i[1][1], limit=limit, count=False)
+                strings = (strings or 1) * (sum(ggen([0], _gen, i[1][-1], limit=limit, count=True)) or 1)
+            ret = ggen(ret, _gen, i[1][-1], limit=limit, count=False)
         # ignore ^ and $
-        elif i[0] == 'at':
+        elif _op(i) == 'at':
             continue
-        elif i[0] == 'not_literal':
+        elif _op(i) == 'not_literal':
             subs = list(CATEGORIES['category_any'])
             subs.remove(chr(i[1]))
             if count:
                 strings = (strings or 1) * len(subs)
             ret = comb(ret, subs)
-        elif i[0] == 'assert':
+        elif _op(i) == 'assert':
             print(i[1][1])
             continue
         else:
@@ -171,29 +186,29 @@ def _randone(d, limit=20):
     """docstring for _randone"""
     ret = ''
     for i in d:
-        if i[0] == 'in':
+        if _op(i) == 'in':
             ret += choice(_in(i[1]))
-        elif i[0] == 'literal':
+        elif _op(i) == 'literal':
             ret += chr(i[1])
-        elif i[0] == 'category':
-            ret += choice(CATEGORIES.get(i[1], ['']))
-        elif i[0] == 'any':
+        elif _op(i) == 'category':
+            ret += choice(_category(i[1]))
+        elif _op(i) == 'any':
             ret += choice(CATEGORIES['category_any'])
-        elif i[0] == 'max_repeat':
-            chars = filter(None, _gen(list(i[1][2]), limit))
+        elif _op(i) == 'max_repeat':
+            chars = [c for c in _gen(list(i[1][2]), limit) if c]
             if i[1][1]+1 - i[1][0] >= limit:
                 min,max = i[1][0], i[1][0]+limit
             else:
                 min,max = i[1][0], i[1][1]
             for _ in range(randint(min, max)):
                 ret += choice(chars)
-        elif i[0] == 'branch':
+        elif _op(i) == 'branch':
             ret += choice(list(chain.from_iterable(_gen(list(x), limit) for x in i[1][1])))
-        elif i[0] == 'subpattern':
-            ret += _randone(i[1][1], limit)
-        elif i[0] == 'at':
+        elif _op(i) == 'subpattern':
+            ret += _randone(i[1][-1], limit)
+        elif _op(i) == 'at':
             continue
-        elif i[0] == 'not_literal':
+        elif _op(i) == 'not_literal':
             c=list(CATEGORIES['category_any'])
             c.remove(chr(i[1]))
             ret += choice(c)
