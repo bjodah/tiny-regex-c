@@ -57,21 +57,44 @@ char *cunquote (char* s, int l)
     return r;
 }
 
+/* A vector file this program cannot read is a failure, not an empty run.
+ * These paths used to `return NULL` with *ntests still zero, so main()
+ * looped over nothing and the summary counted whatever was left: running
+ * ./tests/test1 from the wrong directory printed "1/1 tests succeeded"
+ * and exited 0, and one malformed row appended to tests/ok.lst dropped
+ * all 136 of them the same way. */
+static void die_reading (const char *fname, int line, const char *why)
+{
+    fprintf (stderr, "%s:%d: %s\n", fname, line, why);
+    exit (1);
+}
+
 struct test_case* read_tests (const char *fname, int *ntests)
 {
     char s[80];
     FILE *f = fopen (fname, "rt");
     if (!f)
-      return NULL;
+    {
+      fprintf (stderr, "%s: cannot open (run this from the repository root)\n",
+               fname);
+      exit (1);
+    }
     int size = 120;
     struct test_case* vec = xcalloc (size, sizeof(struct test_case));
     int i = 0;
+    int line = 0;
     *ntests = 0;
     while (fgets(s, 80, f))
     {
         // regex until first tab
         char *p = strchr (s, '\t');
         int l;
+        line++;
+        // A row too long for the buffer would be split, and its tail
+        // parsed as a row of its own; the last line of a file with no
+        // final newline is the one legitimate case.
+        if (!strchr (s, '\n') && !feof (f))
+          die_reading (fname, line, "row longer than this reader's buffer");
         if (!p) // no tab, just an old exreg test
           continue;
         if (s[0] == '#') // outcommented
@@ -81,16 +104,10 @@ struct test_case* read_tests (const char *fname, int *ntests)
         // string from first tab
         char *str = strchr (p, '"');
         if (!str)
-        {
-          fclose (f);
-          return NULL;
-        }
+          die_reading (fname, line, "no quoted subject after the pattern");
         char *end = strchr (str+1, '"');
         if (!end)
-        {
-          fclose (f);
-          return NULL;
-        }
+          die_reading (fname, line, "unterminated quoted subject");
         l = end - str - 1;
         vec[i].text = cunquote (&str[1], l);
 
