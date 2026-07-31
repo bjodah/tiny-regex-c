@@ -131,12 +131,32 @@ in Emacs.  Every quantifier is greedy, `?` included: `a?` on `a` matches
 one character, as it does in Emacs.
 
 Constructs this library cannot honour are rejected rather than
-reinterpreted.  An interval whose contents are not `n`, `n,`, `,m` or
-`n,m` (counts up to 65535, `m` not below `n`), an unterminated `\{`, and
-an unknown POSIX class name are all compile errors; they never fall back
-to matching the literal characters they are spelled with.  Where there is
-nothing to repeat -- the start of the pattern, of a group or of an
-alternative -- `\{` is the literal `{`, as in Emacs.
+reinterpreted, and never compiled into a program that can only fail. The
+accepted language is an exact subset. Rejected, all as in Emacs:
+
+- a `\(` that is never closed, and a `\)` with no group open;
+- a bracket expression that is never closed. A `]` in the first position
+  is a member rather than the terminator, so `[]a]` is `{']', 'a'}` and
+  `[]` and `[^]` are unterminated;
+- an unknown POSIX class name, and an interval whose contents are not
+  `n`, `n,`, `,m` or `n,m` (counts up to 65535, `m` not below `n`) or
+  whose `\{` is never closed. None of these falls back to matching the
+  literal characters it is spelled with;
+- a `\` at the end of the pattern.
+
+Rejected where Emacs instead folds the two quantifiers into one: a
+quantifier on an atom that already carries one (`a++`, `a\{2\}\{3\}`,
+`a*?`). The composition has no faithful spelling here -- `a\{2\}\{2,3\}`
+is 4 or 6 repetitions, not 4 to 6 -- and it used to compile a node the
+matcher could only ever fail on. A quantifier on a *group* is ordinary:
+`\(a\)*` is fine.
+
+Where there is nothing to repeat -- the start of the pattern, of a group
+or of an alternative, and just after an anchor -- `*`, `+`, `?` and `\{`
+are the literal characters, as in Emacs: `*` matches `*`, `^*` matches
+`*`, and `\(*\)` captures it. (Emacs rejects `\(?`, reserving that
+spelling for shy groups, which this library does not have; here it is an
+ordinary literal `?`.)
 
 `^` matches at the start of the subject handed to `re_exec()`, not at its
 `start_offset`: that argument says where to resume scanning, so a

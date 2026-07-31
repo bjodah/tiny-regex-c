@@ -263,6 +263,12 @@ static unsigned char_cp(const regex_t* p) {
   return p->u.cp_lo | ((unsigned)p->u.cp_hi << 16);
 }
 
+/* Whether 'type' is one of the repetition operators. */
+static int isquantifier(unsigned short type) {
+  return type == QUESTIONMARK || type == STAR || type == PLUS ||
+         (unsigned)(type - TIMES) <= TIMES_NM - TIMES;
+}
+
 static unsigned getsize(const regex_t* pattern) {
   static const unsigned char payload_size[] = {
       [CHAR] = sizeof(unsigned short) * 2,
@@ -522,17 +528,23 @@ static int compile_charclass(const char* pattern,
                              const char* storage_end) {
   int i = *pattern_index;
   int char_index = -1;
+  int first = 1;
 
   if (pattern[i + 1] == '^') {
     compiled->type = INV_CHAR_CLASS;
     i++;
-    if (pattern[i + 1] == '\0')
-      return 0;
   } else {
     compiled->type = CHAR_CLASS;
   }
 
-  while (pattern[++i] != ']' && pattern[i] != '\0') {
+  /* A ']' in the first position is a member rather than the terminator,
+   * as it is in Emacs and POSIX: "[]a]" holds ']' and 'a'.  That also
+   * makes "[]" and "[^]" what Emacs calls them -- unterminated, and so a
+   * bad pattern rather than a class nothing can be in. */
+  while (pattern[++i] != '\0') {
+    if (pattern[i] == ']' && !first)
+      break;
+    first = 0;
     if (pattern[i] == '[' && pattern[i + 1] == ':') {
       const char* end = strstr(&pattern[i + 2], ":]");
       if (end) {
@@ -563,6 +575,10 @@ static int compile_charclass(const char* pattern,
     RE_CCL_DAT(compiled)[char_index++] = pattern[i];
   }
 
+  /* Reaching the end of the pattern instead of a ']' used to compile the
+   * bracket expression anyway, so "[a" quietly meant the same as "[a]". */
+  if (pattern[i] != ']')
+    return 0;
   if (RE_CCL_DAT(compiled) + char_index >= storage_end)
     return 0;
   RE_CCL_DAT(compiled)[char_index] = '\0';
@@ -632,17 +648,40 @@ static int compile_interval(const char* s, const char* end, regex_t* node) {
   return 1;
 }
 
-/* Whether a quantifier written here has an atom to repeat.  At the start
- * of the pattern, of a group or of an alternative, and after an anchor,
- * there is none, and Emacs reads "\{" there as a literal '{'. */
-static int quantifiable(const struct re_emitter* em) {
+/* What a quantifier written at this point in the program can mean. */
+enum quant_ctx {
+  /* Nothing to repeat -- the start of the pattern, of a group or of an
+   * alternative, or just after an anchor.  Emacs reads the quantifier
+   * character literally there, and so does this engine. */
+  QUANT_LITERAL,
+  /* The preceding atom already carries a quantifier.  Emacs folds the two
+   * into one; this engine has no faithful spelling for the composition
+   * ("a\{2\}\{2,3\}" is 4 or 6 repetitions, not 4 to 6), and it used to
+   * compile a node the matcher could only ever fail on.  Saying so is
+   * better than either. */
+  QUANT_BAD,
+  QUANT_OK
+};
+
+static enum quant_ctx quant_context(const struct re_emitter* em) {
   unsigned short type;
 
   if (em->nodes == 0)
-    return 0;
+    return QUANT_LITERAL;
   type = emitter_node_at(em, em->nodes - 1)->type & ~RE_TYPE_ICASE;
-  return type != GROUP && type != BRANCH && type != BEGIN && type != END;
+  if (type == GROUP || type == BRANCH || type == BEGIN || type == END)
+    return QUANT_LITERAL;
+  return isquantifier(type) ? QUANT_BAD : QUANT_OK;
 }
+
+/* One "\(" still open while compiling.  The stack replaces two scans over
+ * the half-written program: a forward one through the *pattern* that only
+ * asked whether some later "\)" existed (so "\(\(a\)" compiled), and a
+ * backward one over node indices. */
+struct parse_frame {
+  unsigned group_start;   /* node index of the GROUP */
+  unsigned capture_index; /* its group_num */
+};
 
 /* The "\xXX" escape, *i on the 'x'.  A well-formed one is a single CHAR
  * node holding the byte.  A malformed one is the literal characters it is
@@ -685,6 +724,8 @@ re_t re_compile_to(const char* pattern,
   *size = 0;
 
   struct re_emitter em = {re_data, re_data, re_data + bytes, 0};
+  struct parse_frame open_groups[RE_MAX_SPANS];
+  unsigned depth = 0;
   regex_t* re_compiled;
 
   /* Bound the scan by the pattern length rather than re-reading past the
@@ -706,20 +747,20 @@ re_t re_compile_to(const char* pattern,
       case '.': {
         re_compiled->type = DOT;
       } break;
-      case '*': {
-        if (em.nodes == 0)  // nothing to repeat at position 0
-          return 0;
-        re_compiled->type = STAR;
-      } break;
-      case '+': {
-        if (em.nodes == 0)  // nothing to repeat at position 0
-          return 0;
-        re_compiled->type = PLUS;
-      } break;
+      case '*':
+      case '+':
       case '?': {
-        if (em.nodes == 0)  // nothing to repeat at position 0
+        enum quant_ctx q = quant_context(&em);
+        if (q == QUANT_BAD)
           return 0;
-        re_compiled->type = QUESTIONMARK;
+        if (q == QUANT_LITERAL) {
+          /* Nothing to repeat: Emacs reads the character literally, as it
+           * already does for "\{" in the same position. */
+          re_compiled->type = CHAR;
+          set_char_cp(re_compiled, (unsigned char)c);
+          break;
+        }
+        re_compiled->type = c == '*' ? STAR : c == '+' ? PLUS : QUESTIONMARK;
       } break;
 
       /* Escaped character-classes (\s \S \w \W \d \D \*): */
@@ -749,54 +790,29 @@ re_t re_compile_to(const char* pattern,
               re_compiled->type = NOT_WHITESPACE;
             } break;
             case '(': {
-              const char* p = &pattern[i + 1];
-              int found = 0;
-              while (*p != '\0') {
-                if (*p == '\\') {
-                  if (*(p + 1) == '\0') {
-                    break;
-                  }
-                  if (*(p + 1) == ')') {
-                    found = 1;
-                    break;
-                  }
-                  p += 2;
-                } else {
-                  p++;
-                }
-              }
-              if (found) {
-                num_groups++;
-                if (num_groups >= RE_MAX_SPANS) {
-                  return 0;
-                }
-                re_compiled->type = GROUP;
-                re_compiled->u.group_size = 0;
-                re_compiled->u.group_num = num_groups;
-              } else {
+              num_groups++;
+              if (num_groups >= RE_MAX_SPANS || depth >= RE_MAX_SPANS)
                 return 0;
-              }
+              open_groups[depth].group_start = em.nodes;
+              open_groups[depth].capture_index = (unsigned)num_groups;
+              depth++;
+              re_compiled->type = GROUP;
+              re_compiled->u.group_size = 0;
+              re_compiled->u.group_num = (unsigned char)num_groups;
             } break;
             case ')': {
-              int nestlevel = 0;
-              int k = (int)em.nodes - 1;
-              for (; k >= 0; k--) {
-                regex_t* cur = emitter_node_at(&em, (unsigned)k);
-                if ((cur->type & ~RE_TYPE_ICASE) == GROUPEND)
-                  nestlevel++;
-                else if ((cur->type & ~RE_TYPE_ICASE) == GROUP) {
-                  if (nestlevel == 0) {
-                    cur->u.group_size = (unsigned char)(em.nodes - k - 1);
-                    re_compiled->type = GROUPEND;
-                    re_compiled->u.group_start = (unsigned char)k;
-                    re_compiled->u.group_num_end = cur->u.group_num;
-                    break;
-                  }
-                  nestlevel--;
-                }
-              }
-              if (k < 0)
-                return 0;
+              const struct parse_frame* f;
+              regex_t* open;
+
+              if (depth == 0)
+                return 0; /* "a\)" -- Emacs' "Unmatched ) or \)" */
+              f = &open_groups[--depth];
+              open = emitter_node_at(&em, f->group_start);
+              open->u.group_size =
+                  (unsigned char)(em.nodes - f->group_start - 1);
+              re_compiled->type = GROUPEND;
+              re_compiled->u.group_start = (unsigned char)f->group_start;
+              re_compiled->u.group_num_end = (unsigned char)f->capture_index;
             } break;
             case '|': {
               re_compiled->type = BRANCH;
@@ -808,11 +824,12 @@ re_t re_compile_to(const char* pattern,
                * the interval's own spelling.  With nothing to repeat, the
                * "\{" is Emacs' literal '{' and parsing resumes after it. */
               const char* p = &pattern[i + 1];
+              enum quant_ctx q = quant_context(&em);
               while (*p != '\0' && !(*p == '\\' && *(p + 1) == '}'))
                 p++;
-              if (*p == '\0')
+              if (*p == '\0' || q == QUANT_BAD)
                 return 0;
-              if (!quantifiable(&em)) {
+              if (q == QUANT_LITERAL) {
                 re_compiled->type = CHAR;
                 set_char_cp(re_compiled, '{');
                 break;
@@ -870,6 +887,11 @@ re_t re_compile_to(const char* pattern,
    * the pattern and calling that a success is worse than failing: the
    * caller gets a regex that quietly means something else. */
   if (i < plen)
+    return 0;
+  /* A "\(" that was never closed. The old forward scan only asked whether
+   * *some* later "\)" existed, so "\(\(a\)" satisfied both groups with the
+   * one closing bracket and compiled. */
+  if (depth != 0)
     return 0;
   /* 'UNUSED' is a sentinel used to indicate end-of-pattern. The loop's
    * bounds check only guarantees room for a full regex_t before *starting*
@@ -1356,11 +1378,6 @@ static const char* match_group_iter(regex_t* g,
 
 static unsigned short node_type(const regex_t* p) {
   return p->type & ~RE_TYPE_ICASE;
-}
-
-static int isquantifier(unsigned short type) {
-  return type == QUESTIONMARK || type == STAR || type == PLUS ||
-         (unsigned)(type - TIMES) <= TIMES_NM - TIMES;
 }
 
 /* The GROUPEND closing the group headed by 'g'. Found by walking the

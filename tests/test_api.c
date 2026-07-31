@@ -719,6 +719,86 @@ int main(void) {
         failed += check_compile(&cases[i]);
     }
 
+    /* Test 13b: the rest of the acceptance contract -- groups, bracket
+     * expressions and quantifiers with nothing (or too much) to repeat.
+     * Emacs agrees with every row but "\(?\)", where its rejection is an
+     * artifact of reserving "\(?" for shy groups, which this engine does
+     * not have. */
+    {
+      static const struct compile_case cases[] = {
+          /* a group has to be closed, and closed only once */
+          {"\\(a\\)", RE_STATUS_OK},
+          {"\\(\\(a\\)\\)", RE_STATUS_OK},
+          {"\\(", RE_STATUS_BAD_PATTERN},
+          {"\\(a", RE_STATUS_BAD_PATTERN},
+          {"\\(\\(a\\)", RE_STATUS_BAD_PATTERN},
+          {"\\(a\\|b", RE_STATUS_BAD_PATTERN},
+          {"a\\)", RE_STATUS_BAD_PATTERN},
+          {"\\)", RE_STATUS_BAD_PATTERN},
+          {"\\(a\\)\\)", RE_STATUS_BAD_PATTERN},
+          /* a bracket expression has to be closed; a ']' in the first
+           * position is a member, so "[]" is unterminated */
+          {"[a]", RE_STATUS_OK},
+          {"[]a]", RE_STATUS_OK},
+          {"[]]", RE_STATUS_OK},
+          {"[^]]", RE_STATUS_OK},
+          {"[a", RE_STATUS_BAD_PATTERN},
+          {"[^a", RE_STATUS_BAD_PATTERN},
+          {"[]", RE_STATUS_BAD_PATTERN},
+          {"[^]", RE_STATUS_BAD_PATTERN},
+          {"[", RE_STATUS_BAD_PATTERN},
+          {"[^", RE_STATUS_BAD_PATTERN},
+          {"[a-", RE_STATUS_BAD_PATTERN},
+          {"[[:digit:]", RE_STATUS_BAD_PATTERN},
+          /* nothing to repeat: the quantifier is the literal character */
+          {"*", RE_STATUS_OK},
+          {"+", RE_STATUS_OK},
+          {"?", RE_STATUS_OK},
+          {"^*", RE_STATUS_OK},
+          {"$*", RE_STATUS_OK},
+          {"\\(*\\)", RE_STATUS_OK},
+          {"\\(?\\)", RE_STATUS_OK},
+          {"\\|*", RE_STATUS_OK},
+          {"a\\|*b", RE_STATUS_OK},
+          /* too much to repeat: the atom already carries a quantifier */
+          {"a++", RE_STATUS_BAD_PATTERN},
+          {"a**", RE_STATUS_BAD_PATTERN},
+          {"a*+", RE_STATUS_BAD_PATTERN},
+          {"a?*", RE_STATUS_BAD_PATTERN},
+          {"a*?", RE_STATUS_BAD_PATTERN},
+          {"a\\{2\\}*", RE_STATUS_BAD_PATTERN},
+          {"a\\{2\\}\\{3\\}", RE_STATUS_BAD_PATTERN},
+          {"\\(a\\)**", RE_STATUS_BAD_PATTERN},
+          /* ... but a quantifier on a closed group is ordinary */
+          {"\\(a\\)*", RE_STATUS_OK},
+          {"\\(a\\)\\{2\\}", RE_STATUS_OK},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_compile(&cases[i]);
+    }
+
+    /* Test 13c: what the newly accepted literal quantifiers and bracket
+     * members actually match.  GNU Emacs 31 reports each of these spans. */
+    {
+      static const struct span_case cases[] = {
+          {"*", "*", 1, {{0, 1}}, 0},
+          {"+", "+", 1, {{0, 1}}, 0},
+          {"?", "?", 1, {{0, 1}}, 0},
+          {"^*", "*", 1, {{0, 1}}, 0},
+          {"\\(*\\)", "*", 2, {{0, 1}, {0, 1}}, 0},
+          {"a\\|*b", "*b", 1, {{0, 2}}, 0},
+          {"[]a]", "]", 1, {{0, 1}}, 0},
+          {"[]a]", "a", 1, {{0, 1}}, 0},
+          {"[]]", "]", 1, {{0, 1}}, 0},
+          {"[^]]", "a", 1, {{0, 1}}, 0},
+          {"[^]]", "]", 0, {{0, 0}}, 0},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
     /* Test 14: the caller-storage alignment contract.
      *
      * A compiled program is read in place through the private node type,

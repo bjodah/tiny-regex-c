@@ -52,6 +52,36 @@
  *              those two ask whether the character is ASCII at all.
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
  *
+ * What is a bad pattern:
+ * ----------------------
+ * The accepted language is an exact subset, not a best effort.  A
+ * construct this engine cannot honour is RE_STATUS_BAD_PATTERN; it is
+ * never quietly reinterpreted as something else, and it is never compiled
+ * into a program that can only fail.  Rejected, all as in Emacs:
+ *
+ *   - a '\(' that is never closed, and a '\)' with no group open;
+ *   - a bracket expression that is never closed.  A ']' in the first
+ *     position is a member of the set rather than its terminator, so
+ *     '[]a]' is {']', 'a'} and '[]' and '[^]' are unterminated;
+ *   - an unknown POSIX class name, and a malformed or unterminated
+ *     interval (see '\{n,m\}' above);
+ *   - a '\' at the end of the pattern.
+ *
+ * Rejected, where Emacs instead folds the two quantifiers into one:
+ *
+ *   - a quantifier on an atom that already carries one ('a++',
+ *     'a\{2\}\{3\}', 'a*?').  The composition has no faithful spelling
+ *     here -- 'a\{2\}\{2,3\}' is 4 or 6 repetitions, not 4 to 6 -- and
+ *     this used to compile a node that could never match.  Note that a
+ *     quantifier on a *group* is ordinary: '\(a\)*' is fine.
+ *
+ * Accepted as the literal character, as in Emacs: '*', '+', '?' and '\{'
+ * where there is nothing to repeat -- the start of the pattern, of a group
+ * or of an alternative, and just after an anchor.  So '*' matches "*",
+ * '^*' matches "*", and '\(*\)' captures it.  (Emacs rejects '\(?'
+ * because it reserves that spelling for shy groups, which this engine does
+ * not have; here it is the literal '?' like any other.)
+ *
  * Characters, not bytes:
  * ----------------------
  * The matcher steps by UTF-8 character.  '.' consumes a whole character,

@@ -68,52 +68,56 @@ int main(void)
     "\\\x01[^\\\xff][\\",
     /* Invalid escape. '\\' as last char without previous \\ */
     "\\",
-    /* incomplete char classes */
-    "[^", "[abc\\",
-    /* overlong char classes */
-    "[0123456789012345678901234567890123456789]",
-    "[01234567890123456789\\0123456789012345678]",
+    /* unterminated bracket expressions. A ']' in the first position is a
+     * member, so "[]" and "[^]" are unterminated too -- Emacs' reading. */
+    "[^", "[abc\\", "[a", "[]", "[^]",
     "[00000000000000000000000000000000000000][",
-    /* quantifiers without context: nothing to repeat at position 0 */
-    "+", "?", "*",
-    /* Tests 7-12: invalid quantifiers. */
-    /* note that python and perl allows these, and matches them exact. */
-    // "{2}", "x{}", "x{1,2,}", "x{,2,}", "x{-2}",
     /* intervals Emacs rejects; they used to compile as the literal
      * characters of their own spelling */
     "a\\{2,1\\}", "a\\{65536\\}", "a\\{x\\}", "a\\{1,2,3\\}", "a\\{1", "\\{",
+    /* quantifiers applied to an already-quantified atom. Emacs folds the
+     * two into one; this engine has no faithful spelling for that and
+     * used to compile a node the matcher could only ever fail on. */
+    "a++", "a**", "a*+", "a?*", "a\\{2\\}*", "a\\{2\\}\\{3\\}",
+    /* groups that are never closed, or closed without being opened */
+    "\\(", "\\(a", "\\(\\(a\\)", "a\\)", "\\)", "\\(a\\)\\)",
     /* POSIX class names Emacs rejects, or whose meaning a byte-oriented
      * matcher cannot honour; they used to become a set of the characters
      * spelling the name, so "[[:blank:]]" matched 'a' */
     "[[:foo:]]", "[[:multibyte:]]",
   };
-  /* Indices 5,6,7 are overlong char-classes that re_compile() currently
-   * accepts instead of rejecting; documented as a known bug (xfail). An
-   * unexpected rejection there is an XPASS that fails CI. */
   const size_t ntests_invalid = sizeof(tests)/sizeof(*tests);
-  const int xfail_invalid[] = {0,0,0,0,0,1,1,1,0,0,0,
-                               0,0,0,0,0,0,
-                               0,0};
 
   for (i = 0; i < ntests_invalid; i++)
   {
     const char *s = tests[i];
-    re_t p = re_compile(s);
-    int compiled = (p != NULL);
     ntests++;
-    if (xfail_invalid[i])
-    {
-      /* expected to compile (bug): reject == XPASS */
-      if (!compiled)
-      {
-        printf(" [%d] XPASS: re_compile(\"%s\") now correctly rejects.\n", ntests, s);
-        unexpected++;
-      }
-    }
-    else if (compiled)
+    if (re_compile(s) != NULL)
     {
       printf(" [%d] re_compile(\"%s\") must not compile.\n", ntests, s);
       failed++;
+    }
+  }
+  printf(" %d/%d tests succeeded.\n", ntests-failed-unexpected, ntests);
+
+  /* Patterns the invalid list used to carry as expected-to-compile bugs.
+   * The class buffer they were too long for has been gone since class data
+   * moved inline with its own bounds checks; they are ordinary patterns. */
+  printf("Testing acceptance of long bracket expressions:\n");
+  {
+    static const char *const valid[] = {
+      "[0123456789012345678901234567890123456789]",
+      "[01234567890123456789\\0123456789012345678]",
+    };
+    size_t v;
+    for (v = 0; v < sizeof(valid)/sizeof(*valid); v++)
+    {
+      ntests++;
+      if (re_compile(valid[v]) == NULL)
+      {
+        printf(" [%d] re_compile(\"%s\") must compile.\n", ntests, valid[v]);
+        failed++;
+      }
     }
   }
   printf(" %d/%d tests succeeded.\n", ntests-failed-unexpected, ntests);

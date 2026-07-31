@@ -135,3 +135,17 @@ x?x			"x"		1
 ab?			"ab"		2
 [ab][ab]?		"baab1acc"	2
 c[^a]?			"bc1cacc."	2
+# A quantifier with nothing to repeat is the literal character, as in
+# Emacs -- at the start of the pattern, of a group or of an alternative,
+# and after an anchor. These used to be rejected outright.
+*			"*"		1
++			"+"		1
+?			"?"		1
+^*			"*"		1
+\(*\)			"*"		1
+a\|*b			"*b"		2
+# A ']' in the first position of a bracket expression is a member, which
+# is what makes "[]" unterminated rather than an empty class.
+[]a]			"a"		1
+[]]			"]"		1
+[^]]			"a"		1
