@@ -177,6 +177,27 @@ re_status re_compile_checked(const char* pattern,
                              unsigned* storage_size,
                              re_t* out);
 
+/* FreeBSD's <unistd.h> declares an unrelated, long-obsolete `re_exec()`
+ * (the removed 4.2BSD regexp(3) API, alongside `re_comp()`) whenever
+ * __BSD_VISIBLE is set, which it is there by default.  A host that also
+ * includes <unistd.h> -- as kg's def.h does -- gets a "conflicting types"
+ * error at this declaration.  Renaming this engine's entry point at the
+ * preprocessor level, rather than requesting a feature-test macro that
+ * would hide that declaration, keeps the rest of that __BSD_VISIBLE block
+ * (e.g. mkdtemp(), which kg's tests use) visible, and leaves every other
+ * platform's symbol name unchanged.
+ *
+ * <unistd.h> is pulled in first, on that platform only, so the rename is
+ * independent of include order: a translation unit that reached this
+ * header before <unistd.h> would otherwise rename unistd.h's declaration
+ * too and conflict under the new name instead.  Leaving that to each
+ * consumer's include order does not survive contact with clang-format,
+ * whose main-header rule puts "foo.h" first in foo.c and would undo it. */
+#if defined(__FreeBSD__)
+#include <unistd.h>  // IWYU pragma: keep
+#define re_exec tre_re_exec
+#endif
+
 /* Search `text` for the leftmost match at or after `start_offset`.
  *
  * `start_offset` says where to resume scanning; it does not redefine the
