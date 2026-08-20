@@ -31,6 +31,19 @@ struct span_case {
   int offset;
 };
 
+/* A span_case under a match limit.  'limit' is re_exec_bounded()'s, a
+ * byte offset into 'text'; RE_LIMIT_NONE is the unlimited control.  Every
+ * expectation is what GNU Emacs 31.0.91 answers for the same pattern and
+ * subject with re-search-forward's BOUND at the same byte offset. */
+struct window_case {
+  const char* pattern;
+  const char* text;
+  int offset;
+  int limit;
+  int nspans;
+  int spans[3][2];
+};
+
 /* A pattern and the status re_compile_checked() must report for it. */
 struct compile_case {
   const char* pattern;
@@ -370,6 +383,254 @@ static int test_execution_state(void) {
  * now RE_STATUS_TOO_COMPLEX. What must not change is the empty-body
  * fallback: a group whose body matches empty can still satisfy a minimum
  * count past the ceiling, and GNU Emacs 31 agrees that it does. */
+/* Run one window_case: execute under its limit and compare spans.  The
+ * limit is a bound on CONSUMPTION, so the invariant every OK row also
+ * carries is that no span ends past it. */
+static int check_window(const struct window_case* c) {
+  cases_run++;
+  _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
+  unsigned size = sizeof(storage);
+  re_t regex = NULL;
+  re_match_result res;
+  re_status status;
+  int failed = 0;
+  int i;
+
+  if (re_compile_checked(c->pattern, RE_FLAG_NONE, storage, &size, &regex) !=
+      RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: re_compile_checked(\"%s\") failed\n", c->pattern);
+    return 1;
+  }
+
+  status = re_exec_bounded(regex, c->text, c->offset, c->limit, NULL, &res);
+  if (c->nspans == 0) {
+    if (status == RE_STATUS_OK)
+      fprintf(stderr, "FAIL: \"%s\" on \"%s\" (offset %d, limit %d) matched "
+                      "[%d, %d)\n",
+              c->pattern, c->text, c->offset, c->limit, res.spans[0].start,
+              res.spans[0].end);
+    return status == RE_STATUS_OK;
+  }
+  if (status != RE_STATUS_OK) {
+    fprintf(stderr, "FAIL: \"%s\" on \"%s\" (offset %d, limit %d) did not "
+                    "match (status %d)\n",
+            c->pattern, c->text, c->offset, c->limit, status);
+    return 1;
+  }
+  for (i = 0; i < c->nspans && i < res.nspans; i++) {
+    if (res.spans[i].start != c->spans[i][0] ||
+        res.spans[i].end != c->spans[i][1]) {
+      fprintf(stderr, "FAIL: \"%s\" on \"%s\" (offset %d, limit %d): span %d "
+                      "[%d, %d), expected [%d, %d)\n",
+              c->pattern, c->text, c->offset, c->limit, i, res.spans[i].start,
+              res.spans[i].end, c->spans[i][0], c->spans[i][1]);
+      failed++;
+    }
+    if (c->limit != RE_LIMIT_NONE && res.spans[i].end > c->limit) {
+      fprintf(stderr, "FAIL: \"%s\" on \"%s\": span %d ends at %d, past the "
+                      "limit %d\n",
+              c->pattern, c->text, i, res.spans[i].end, c->limit);
+      failed++;
+    }
+  }
+  return failed;
+}
+
+/* kg's backward rule, spelled against the bounded entry point: sweep
+ * candidate starts forward and keep the LAST match ending at or before the
+ * limit, stepping one byte past each match's start so overlapping matches
+ * are not skipped.  This engine has no backward entry, so this is the
+ * shape re.h's contract promises works -- and it only works because each
+ * call is BOUNDED: with the limit applied as a filter over unbounded
+ * results, a start whose preferred branch crosses the limit contributes
+ * nothing instead of contributing its shorter branch. */
+static int backward_scan(re_t regex, const char* text, int limit,
+                         re_span* out_span) {
+  int offset = 0;
+  int found = 0;
+  int len = (int)strlen(text);
+
+  while (offset <= len) {
+    re_match_result res;
+    int next;
+
+    if (re_exec_bounded(regex, text, offset, limit, NULL, &res) !=
+        RE_STATUS_OK)
+      break;
+    if (res.spans[0].end <= limit) {
+      *out_span = res.spans[0];
+      found = 1;
+    }
+    next = (res.spans[0].start > offset ? res.spans[0].start : offset) + 1;
+    if (next <= offset)
+      break;
+    offset = next;
+  }
+  return found;
+}
+
+/* The match window: a byte offset past which the matcher may not consume,
+ * distinct from the subject's own end.  Two published defects are here --
+ * a bounded search that rejects an over-limit preferred match and then
+ * stops, and one that would hold '\'' at the limit if the limit were a
+ * truncation.  Emacs' answers are in the table above the rows. */
+static int test_match_window(void) {
+  static const struct window_case cases[] = {
+      /* The canonical case: the preferred alternative reaches its 'b'
+       * outside the limit, so it loses to the later 'x' inside it.  The
+       * unlimited control below it is the same pattern's other answer. */
+      {"a.*b\\|x", "axxxb", 0, 3, 1, {{1, 2}}},
+      {"a.*b\\|x", "axxxb", 0, 5, 1, {{0, 5}}},
+      {"a.*b\\|x", "axxxb", 0, RE_LIMIT_NONE, 1, {{0, 5}}},
+      {"a.*b\\|x", "axxxb", 0, 99, 1, {{0, 5}}},
+      /* ... and the same start yields a SHORTER branch rather than
+       * dropping out, which is the property a post-match filter cannot
+       * have. */
+      {"a.*b\\|ax", "axxxb", 0, 3, 1, {{0, 2}}},
+      /* greedy repetition hands characters back at the limit */
+      {"a.*", "axxxb", 0, 3, 1, {{0, 3}}},
+      {"a.*b", "axxxb", 0, 3, 0, {{0, 0}}},
+      {"a*", "aaab", 0, 2, 1, {{0, 2}}},
+      {"a*b", "aaab", 0, 2, 0, {{0, 0}}},
+      {".*c", "abcabc", 0, 4, 1, {{0, 3}}},
+      {".*c", "abcabc", 0, 6, 1, {{0, 6}}},
+      {"a\\{1,3\\}b", "aaab", 0, 4, 1, {{0, 4}}},
+      {"a\\{1,3\\}b", "aaab", 0, 3, 0, {{0, 0}}},
+      {"\\(a\\|aa\\)b", "aaab", 0, 4, 2, {{1, 4}, {1, 3}}},
+      {"\\(a*\\)ab", "aab", 0, 3, 2, {{0, 3}, {0, 1}}},
+      /* a group that cannot complete under the limit is skipped, not
+       * failed, when its quantifier lets it be */
+      {"\\(ab\\)*", "xaby", 1, 2, 2, {{1, 1}, {-1, -1}}},
+      {"\\(ab\\)*", "xaby", 1, 3, 2, {{1, 3}, {1, 3}}},
+      /* a match ending exactly AT the limit is legal; one byte more is
+       * not */
+      {"bc", "abcd", 0, 3, 1, {{1, 3}}},
+      {"bc", "abcd", 0, 2, 0, {{0, 0}}},
+      {"bcd", "abcd", 0, 4, 1, {{1, 4}}},
+      {"bcd", "abcd", 0, 3, 0, {{0, 0}}},
+      /* an empty alternative under the limit, and empty matches at it */
+      {"xxxx\\|", "axxxb", 1, 3, 1, {{1, 1}}},
+      {"xxxx\\|xx", "axxxb", 1, 3, 1, {{1, 3}}},
+      {"a.*b\\|", "axxxb", 0, 3, 1, {{0, 0}}},
+      {"x\\|", "abc", 0, 2, 1, {{0, 0}}},
+      {"q*", "axxxb", 0, 3, 1, {{0, 0}}},
+      {"q*", "axxxb", 0, 0, 1, {{0, 0}}},
+      {"x*", "axxxb", 2, 2, 1, {{2, 2}}},
+      {"a+", "aabc", 0, 0, 0, {{0, 0}}},
+      /* THE CONTROL THAT PROVES THE LIMIT IS NOT A TRUNCATION: '\'' and
+       * '$' hold only where the subject really ends.  Truncating "axxxb"
+       * to the limit would match "x\'" at [3, 4). */
+      {"x\\'", "axxxb", 0, 4, 0, {{0, 0}}},
+      {"x\\'", "axxxb", 0, 5, 0, {{0, 0}}},
+      {"x$", "axxxb", 0, 4, 0, {{0, 0}}},
+      {".*\\'", "axxxb", 0, 3, 0, {{0, 0}}},
+      {"b\\'", "axxxb", 0, 4, 0, {{0, 0}}},
+      {"b\\'", "axxxb", 0, 5, 1, {{4, 5}}},
+      {"b\\'", "axxxb", 0, RE_LIMIT_NONE, 1, {{4, 5}}},
+      {"x*\\'", "axxxb", 0, 5, 1, {{5, 5}}},
+      /* '\`' is unaffected: it holds at the subject's start whatever the
+       * limit says, and only what follows it is bounded */
+      {"\\`a", "axxxb", 0, 3, 1, {{0, 1}}},
+      {"\\`x", "axxxb", 0, 3, 0, {{0, 0}}},
+      {"\\`ax", "axxxb", 0, 2, 1, {{0, 2}}},
+      {"\\`ax", "axxxb", 0, 1, 0, {{0, 0}}},
+      /* consumption stays whole-character: a glyph starting under the
+       * limit and ending past it is not consumed at all */
+      {".", "a\xc3\xa5" "bc", 1, 2, 0, {{0, 0}}},
+      {".", "a\xc3\xa5" "bc", 1, 3, 1, {{1, 3}}},
+      {".*", "a\xc3\xa5" "bc", 0, 2, 1, {{0, 1}}},
+      {".*", "a\xc3\xa5" "bc", 0, 3, 1, {{0, 3}}},
+      /* a start past the limit is no match, never a match past it */
+      {"x", "axxxb", 2, 1, 0, {{0, 0}}},
+      {"x*", "axxxb", 2, 1, 0, {{0, 0}}},
+      {"a", "abc", 0, -2, 0, {{0, 0}}},
+  };
+  /* The backward twin of the two canonical rows: kg's "last match ending
+   * at or before the limit" over the same subject.  The second is the one
+   * that fails when the limit is only a filter. */
+  static const struct {
+    const char* pattern;
+    const char* text;
+    int limit;
+    int start, end;
+  } back[] = {
+      {"a.*b\\|x", "axxxb", 3, 2, 3},
+      {"a.*b\\|ax", "axxxb", 3, 0, 2},
+      {"ab\\|b", "abab", 3, 1, 2},
+  };
+  int failed = 0;
+  size_t i;
+
+  for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+    failed += check_window(&cases[i]);
+
+  for (i = 0; i < sizeof(back) / sizeof(*back); i++) {
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
+    unsigned size = sizeof(storage);
+    re_t regex = NULL;
+    re_span span = {-1, -1};
+
+    cases_run++;
+    if (re_compile_checked(back[i].pattern, RE_FLAG_NONE, storage, &size,
+                           &regex) != RE_STATUS_OK) {
+      fprintf(stderr, "FAIL: could not compile \"%s\"\n", back[i].pattern);
+      failed++;
+      continue;
+    }
+    if (!backward_scan(regex, back[i].text, back[i].limit, &span) ||
+        span.start != back[i].start || span.end != back[i].end) {
+      fprintf(stderr, "FAIL: backward scan of \"%s\" over \"%s\" under limit "
+                      "%d gave [%d, %d), expected [%d, %d)\n",
+              back[i].pattern, back[i].text, back[i].limit, span.start,
+              span.end, back[i].start, back[i].end);
+      failed++;
+    }
+  }
+
+  /* The unlimited control, stated as an identity rather than as a table:
+   * RE_LIMIT_NONE and a limit at the subject's length must both answer
+   * exactly what re_exec() answers, span for span. */
+  {
+    static const char* const pats[] = {"a.*b\\|x", "\\(a\\)\\(b*\\)c",
+                                       "x\\'",     "\\`a.*",
+                                       "q*",       "[a-z]\\{2,3\\}"};
+    static const char* const texts[] = {"axxxb", "abbbc", "", "a"};
+    size_t pi, ti;
+
+    for (pi = 0; pi < sizeof(pats) / sizeof(*pats); pi++) {
+      for (ti = 0; ti < sizeof(texts) / sizeof(*texts); ti++) {
+        _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[256];
+        unsigned size = sizeof(storage);
+        re_t regex = NULL;
+        re_match_result plain, none, full;
+        re_status s_plain, s_none, s_full;
+        int len = (int)strlen(texts[ti]);
+
+        cases_run++;
+        if (re_compile_checked(pats[pi], RE_FLAG_NONE, storage, &size,
+                               &regex) != RE_STATUS_OK) {
+          fprintf(stderr, "FAIL: could not compile \"%s\"\n", pats[pi]);
+          failed++;
+          continue;
+        }
+        s_plain = re_exec(regex, texts[ti], 0, &plain);
+        s_none = re_exec_bounded(regex, texts[ti], 0, RE_LIMIT_NONE, NULL,
+                                 &none);
+        s_full = re_exec_bounded(regex, texts[ti], 0, len, NULL, &full);
+        if (s_plain != s_none || s_plain != s_full ||
+            memcmp(plain.spans, none.spans, sizeof(plain.spans)) != 0 ||
+            memcmp(plain.spans, full.spans, sizeof(plain.spans)) != 0) {
+          fprintf(stderr, "FAIL: \"%s\" on \"%s\": unlimited call differs "
+                          "from re_exec() (status %d/%d/%d)\n",
+                  pats[pi], texts[ti], s_plain, s_none, s_full);
+          failed++;
+        }
+      }
+    }
+  }
+  return failed;
+}
+
 static int test_group_repeat_ceiling(void) {
   static const int counts[] = {255, 256, 257, 300};
   _Alignas(RE_STORAGE_ALIGNMENT) static unsigned char storage[256];
@@ -1480,6 +1741,7 @@ int main(void) {
 
   failed += test_execution_state();
   failed += test_group_repeat_ceiling();
+  failed += test_match_window();
 
   printf("%lu case(s) executed, %d check(s) failed.\n", cases_run, failed);
   return failed ? 1 : 0;

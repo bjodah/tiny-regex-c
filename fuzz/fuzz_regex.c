@@ -12,7 +12,9 @@ enum { MaxFieldSize = 4096 };
  * input-derived buffer size to also cover its bounds checking.
  *
  * Input format: the first byte selects the small buffer's size, 1..64; the
- * rest splits at the first '\n' into pattern and subject text. */
+ * rest splits at the first '\n' into pattern and subject text.  That same
+ * first byte picks the match limit re_exec_bounded() is given below, so
+ * the input encoding is unchanged by covering the bounded entry point. */
 /* libFuzzer resolves this entry point by name at link time, so it cannot
  * have internal linkage, and no header declares it either.
  * NOLINTNEXTLINE(misc-use-internal-linkage) */
@@ -53,6 +55,25 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (p) {
     int length2;
     (void)re_matchp(p, text, &length2);
+  }
+
+  /* The bounded entry point over the same subject, at both spellings of
+   * "unlimited" and at one input-selected byte offset into it, which is
+   * where a match limit that is not a truncation has to keep its footing
+   * on ill-formed UTF-8 and on empty subjects alike. */
+  {
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char roomy[RE_MAX_COMPILED_BYTES];
+    unsigned roomy_size = sizeof(roomy);
+    re_t full = NULL;
+
+    if (re_compile_checked(pattern, RE_FLAG_NONE, roomy, &roomy_size, &full) ==
+        RE_STATUS_OK) {
+      re_match_result bounded;
+      (void)re_exec_bounded(full, text, 0, RE_LIMIT_NONE, NULL, &bounded);
+      (void)re_exec_bounded(full, text, 0,
+                            (int)((size_t)buf_size_selector % (text_len + 1)),
+                            NULL, &bounded);
+    }
   }
 
   return 0;

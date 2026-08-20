@@ -416,6 +416,7 @@ static int re_matchp_internal(re_t pattern,
                               const char* text,
                               int* matchlength,
                               const char* text_start,
+                              const char* text_limit,
                               const re_exec_options* options,
                               re_match_result* out,
                               int* exhausted);
@@ -500,6 +501,16 @@ re_status re_exec_with_options(re_t regex,
                                int start_offset,
                                const re_exec_options* options,
                                re_match_result* out) {
+  return re_exec_bounded(regex, text, start_offset, RE_LIMIT_NONE, options,
+                         out);
+}
+
+re_status re_exec_bounded(re_t regex,
+                          const char* text,
+                          int start_offset,
+                          int limit,
+                          const re_exec_options* options,
+                          re_match_result* out) {
   int exhausted = 0;
 
   if (!regex) {
@@ -510,6 +521,16 @@ re_status re_exec_with_options(re_t regex,
   }
   int len = (int)strlen(text);
   if (start_offset < 0 || start_offset > len) {
+    return RE_STATUS_NO_MATCH;
+  }
+  /* A limit at or past the subject's end is no limit at all, and is the
+   * one RE_LIMIT_NONE folds onto: past that point the subject's own end
+   * is the tighter bound, and the two spellings must not answer
+   * differently. */
+  if (limit == RE_LIMIT_NONE || limit > len) {
+    limit = len;
+  }
+  if (limit < 0 || start_offset > limit) {
     return RE_STATUS_NO_MATCH;
   }
 
@@ -533,7 +554,7 @@ re_status re_exec_with_options(re_t regex,
 
   int matchlength = 0;
   int res = re_matchp_internal(regex, text + start_offset, &matchlength, text,
-                               options, out, &exhausted);
+                               text + limit, options, out, &exhausted);
   if (res >= 0) {
     if (out) {
       out->spans[0].start = start_offset + res;
@@ -1400,6 +1421,11 @@ typedef struct {
   const char* text_start;  /* offset 0 for reported spans, and where '^'
                             * holds -- re_exec()'s start_offset says where
                             * to resume scanning, not where the line begins */
+  const char* text_limit;  /* one past the last byte a match may CONSUME.
+                            * Not the subject's end and not a stand-in for
+                            * it: '$' still asks about the terminator, so a
+                            * limit short of it excludes a match without
+                            * making the anchor hold early. */
   const regex_t* prog_end; /* the UNUSED sentinel */
   re_match_result* out;
   int has_branch; /* whether the pattern contains '\|' at all */
@@ -1558,6 +1584,11 @@ static const char* match_atom(const regex_t* p,
 
   while (n < max && *pos != '\0') {
     re_glyph g = glyph_at(pos);
+    /* The one place this engine consumes, so the one place the match
+     * limit has to hold.  A character that starts under the limit and
+     * ends past it is not half-consumed: it is not consumed. */
+    if (pos + g.len > ctx->text_limit)
+      break;
     if (!matchone(p, &g))
       break;
     pos += g.len;
@@ -1780,11 +1811,13 @@ static const char* match_seq(const regex_t* p,
 static void init_ctx(re_ctx* ctx,
                      re_t pattern,
                      const char* text_start,
+                     const char* text_limit,
                      const re_exec_options* options,
                      re_match_result* out) {
   const regex_t* p = pattern;
 
   ctx->text_start = text_start;
+  ctx->text_limit = text_limit;
   ctx->out = out;
   ctx->has_branch = 0;
   ctx->steps = 0;
@@ -1814,6 +1847,7 @@ static int re_matchp_internal(re_t pattern,
                               const char* text,
                               int* matchlength,
                               const char* text_start,
+                              const char* text_limit,
                               const re_exec_options* options,
                               re_match_result* out,
                               int* exhausted) {
@@ -1825,7 +1859,7 @@ static int re_matchp_internal(re_t pattern,
   if (!pattern)
     return -1;
 
-  init_ctx(&ctx, pattern, text_start, options, out);
+  init_ctx(&ctx, pattern, text_start, text_limit, options, out);
   /* A leading '^' can only hold at the start of the subject, so no offset
    * past the first one is worth trying -- and when the scan resumes past
    * it, not even that one can match.  Unless a '\|' means the anchor
@@ -1845,6 +1879,11 @@ static int re_matchp_internal(re_t pattern,
     if (anchored || ctx.exhausted || text[idx] == '\0')
       break;
     idx += (int)glyph_at(text + idx).len;
+    /* A start past the limit has no match to report: even the empty one
+     * would end past it.  The start exactly AT the limit was tried above,
+     * which is what makes an empty match there an ordinary result. */
+    if (text + idx > ctx.text_limit)
+      break;
   }
 
   *exhausted = ctx.exhausted;

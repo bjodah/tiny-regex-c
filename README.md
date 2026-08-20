@@ -176,6 +176,44 @@ ordinary literal `?`.)
 `start_offset`: that argument says where to resume scanning, so a
 `^`-anchored pattern cannot match at a non-zero offset.
 
+### The match window
+`re_exec_bounded()` takes a **match limit**: a byte offset into the
+subject past which the matcher may not *consume*.
+
+```C
+re_status st = re_exec_bounded(regex, text, 0, 3, NULL, &result);
+```
+
+It is a limit, not a shorter subject, and that distinction is the whole
+point of it being a parameter. The subject anchors keep testing the real
+endpoints: `\'` and `$` hold only where the subject really ends, never at
+the limit, and `` \` `` and `^` only at the subject's start. `x\'` over
+`"axxxb"` under limit 4 is therefore no match -- as it is in Emacs --
+where matching against a truncated `"axxx"` would report `[3, 4)`.
+
+The limit is enforced *during* matching, so backtracking sees it. A greedy
+branch that would cross it hands characters back, a preferred alternative
+that cannot fit under it loses to a later one at the same start, and the
+scan then goes on to later candidate starts. `a.*b\|x` over `"axxxb"`
+under limit 3 matches the `x` at `[1, 2)`; `a.*b\|ax` under the same limit
+matches `[0, 2)`, the shorter branch at the same start. Applying the limit
+as a filter over unbounded results gives neither answer.
+
+A match may end exactly *at* the limit; one needing a byte more may not. An
+empty match at the limit is an ordinary result. A multi-byte character that
+starts under the limit and ends past it is not consumed at all.
+
+`RE_LIMIT_NONE`, and any limit at or past the subject's length, are the
+unlimited call, which is exactly what `re_exec()` and
+`re_exec_with_options()` make. A start offset past the limit is
+`RE_STATUS_NO_MATCH`.
+
+This library has no backward entry point. A backward search is a
+caller-side sweep over this one -- try each candidate start and keep the
+last match ending at or before the limit -- and passing the same limit to
+every call of that sweep is what makes it agree with a bounded forward
+search.
+
 ### Bounds, cancellation, and reentrancy
 A match attempt is bounded: `re_exec()` returns `RE_STATUS_TOO_COMPLEX`
 rather than backtracking forever, and that answer is deliberately not

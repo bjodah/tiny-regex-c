@@ -264,6 +264,64 @@ re_status re_exec_with_options(re_t regex,
                                const re_exec_options* options,
                                re_match_result* out);
 
+/* re_exec_bounded()'s "there is no limit" spelling: the match may consume
+ * the whole subject, which is what every other entry point passes. */
+#define RE_LIMIT_NONE (-1)
+
+/* re_exec_with_options() under a match LIMIT.
+ *
+ * `limit` is a BYTE offset into `text`, and it is where consumption
+ * stops: no reported span may end past it, and no repetition, alternative
+ * or group may consume a character that would cross it.  RE_LIMIT_NONE is
+ * "no limit", and so is any `limit` at or past the subject's length -- a
+ * call spelled either way behaves exactly as re_exec_with_options() does.
+ * A `limit` that is negative and not RE_LIMIT_NONE, and a `start_offset`
+ * past `limit`, are RE_STATUS_NO_MATCH.
+ *
+ * It is a limit, NOT a shorter subject.  The subject anchors keep testing
+ * the real endpoints: '\'' (and '$') holds only at `text`'s terminator,
+ * never at `limit`, and '\`' (and '^') only at `text` itself, never at
+ * `start_offset`.  Truncating the subject would answer differently, which
+ * is why this is a parameter: "x\'" over "axxxb" under limit 4 is
+ * RE_STATUS_NO_MATCH here and in GNU Emacs, and a match on a truncated
+ * "axxx".
+ *
+ * The limit is enforced DURING matching, so backtracking sees it.  A
+ * greedy branch that would cross it hands characters back; a preferred
+ * alternative that cannot fit under it loses to a later one at the same
+ * start; and the scan then goes on to later candidate starts.  So
+ * "a.*b\|x" over "axxxb" under limit 3 matches the 'x' at [1, 2) -- the
+ * answer Emacs' bounded re-search-forward gives -- rather than reporting
+ * the preferred, over-limit "a.*b" or refusing the whole subject.
+ *
+ * A match may end exactly AT the limit; one that needs a single byte more
+ * may not.  An empty match at the limit is an ordinary result, so a
+ * pattern that can match empty still matches at `start_offset` whenever
+ * `start_offset <= limit`.  A multi-byte character that begins before the
+ * limit and ends past it cannot be consumed at all: consumption is by
+ * whole character here as everywhere else in this engine.
+ *
+ * A spent budget is still RE_STATUS_TOO_COMPLEX and a limit that excludes
+ * every match is RE_STATUS_NO_MATCH.  The limit never turns one of those
+ * answers into the other.
+ *
+ * BACKWARD SEARCH.  This engine has no backward entry point: a backward
+ * search is a caller-side scan over this one -- try each candidate start
+ * from the earliest allowed and keep the LAST match that ends at or before
+ * the limit.  Handing the same `limit` to every call of that scan is what
+ * makes it agree with a bounded forward search, because a start whose
+ * preferred branch crosses the limit then yields its shorter branch
+ * instead of dropping out of the scan altogether.  "a.*b\|ax" over
+ * "axxxb" under limit 3 is the case that shows it: the scan's answer is
+ * [0, 2), and it is unreachable when the limit is only a filter applied to
+ * unbounded results. */
+re_status re_exec_bounded(re_t regex,
+                          const char* text,
+                          int start_offset,
+                          int limit,
+                          const re_exec_options* options,
+                          re_match_result* out);
+
 /* Compile regex string pattern to custom buffer, returning # of bytes used.
  * `re_data` must be aligned to RE_STORAGE_ALIGNMENT; a buffer that is not is
  * rejected (NULL return) rather than written to.  A buffer too small for the
