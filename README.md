@@ -73,6 +73,12 @@ The following features / regex-operators are supported by this library.
   -  `.`         Dot, matches any character except newline
   -  `^`         Start anchor, matches beginning of string
   -  `$`         End anchor, matches end of string
+  -  ``\` ``      Subject-start anchor, the same assertion `^` makes here.
+     Emacs' `^` and `$` also hold at line boundaries and this engine's do
+     not, so the two spellings are one node here and differ there; on a
+     subject with no newline in it they agree, which is what this spelling
+     is for
+  -  `\'`        Subject-end anchor, the same relationship to `$`
   -  `*`         Asterisk, match zero or more (greedy)
   -  `+`         Plus, match one or more (greedy)
   -  `?`         Question, match zero or one (greedy)

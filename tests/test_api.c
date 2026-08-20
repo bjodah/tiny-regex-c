@@ -1261,6 +1261,38 @@ int main(void) {
       }
     }
 
+    /* Test 13e: the subject anchors, '\\`' and '\\''.  Every span below is
+     * what GNU Emacs 31 reports for the same call.  They are this engine's
+     * '^' and '$' under another spelling -- the escaped-character
+     * fall-through used to make a literal '`' or '\'' of them, so
+     * "\\`abc" matched "x`abc" -- and the two offset cases are the reason
+     * the alias is honest: '\\`' holds at the start of the SUBJECT, never
+     * at re_exec()'s resume point, which is what Emacs answers too. */
+    {
+      static const struct span_case cases[] = {
+          {"\\`abc", "abcd", 1, {{0, 3}}, 0},
+          {"\\`abc", "x`abc", 0, {{0, 0}}, 0},
+          {"abc\\'", "xabc", 1, {{1, 4}}, 0},
+          {"abc\\'", "abcd", 0, {{0, 0}}, 0},
+          {"\\`abc\\'", "abc", 1, {{0, 3}}, 0},
+          {"\\`", "`", 1, {{0, 0}}, 0},
+          {"\\'", "abc", 1, {{3, 3}}, 0},
+          {"\\`\\'", "", 1, {{0, 0}}, 0},
+          {"\\`\\'", "a", 0, {{0, 0}}, 0},
+          {"a\\`b", "ab", 0, {{0, 0}}, 0},
+          {"\\`\\(a\\)\\|b", "ab", 2, {{0, 1}, {0, 1}}, 0},
+          {"\\(\\`a\\|b\\)", "xa", 0, {{0, 0}}, 0},
+          /* Resuming the scan past offset 0 does not move the subject's
+           * start: (string-match "\\`a" "ba" 1) is nil in Emacs, and
+           * (string-match "a\\'" "ba" 1) is 1. */
+          {"\\`a", "ba", 0, {{0, 0}}, 1},
+          {"a\\'", "ba", 1, {{1, 2}}, 1},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
     /* Test 14: the caller-storage alignment contract.
      *
      * A compiled program is read in place through the private node type,

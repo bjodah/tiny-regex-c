@@ -11,6 +11,16 @@
  *   '.'        Dot, matches any character except newline
  *   '^'        Start anchor, matches beginning of string
  *   '$'        End anchor, matches end of string
+ *   '\`'       Subject-start anchor, matches the beginning of the
+ *              subject.  Exactly the assertion '^' makes here: this
+ *              engine's anchors have always been whole-subject ones, so
+ *              the two spellings are one node.  They are NOT one thing in
+ *              Emacs, where '^' also holds after every newline and '$'
+ *              before every one; on a subject with no newline in it -- the
+ *              only kind this engine's caller can tell apart -- they
+ *              coincide, and that is the agreement this spelling is for.
+ *   '\''       Subject-end anchor, matches the end of the subject; the
+ *              same relationship to '$'.
  *   '*'        Asterisk, match zero or more (greedy)
  *   '+'        Plus, match one or more (greedy)
  *   '?'        Question, match zero or one (greedy)

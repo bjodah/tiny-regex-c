@@ -6,7 +6,7 @@
 # differently would test the wrong language. Every row of tests/ok.lst
 # is executed by tests/test1.c regardless.
 #
-# 64 of 136 rows.
+# 64 of 148 rows.
 \d		"5"		1
 \w+		"hej"		3
 \s		"\t \n"		1

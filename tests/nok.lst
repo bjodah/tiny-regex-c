@@ -50,3 +50,13 @@ a\)		"a)"		0
 # An atom that already carries a quantifier cannot take another.
 a++		"aa"		0
 a\{2\}\{3\}	"aaaaaa"	0
+# Emacs' subject anchors: '\`' is the start of the whole subject and
+# '\'' its end, so neither can hold anywhere else -- and neither is the
+# literal punctuation the escaped-character default used to make of them.
+\`abc	"x`abc"	0
+abc\'	"abcd"	0
+a\`b	"ab"	0
+\`a\'	"ab"	0
+\`\'	"a"	0
+\(\`a\|b\)	"xa"	0
+x\|\`a	"za"	0

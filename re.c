@@ -792,7 +792,9 @@ re_t re_compile_to(const char* pattern,
         re_compiled->type = c == '*' ? STAR : c == '+' ? PLUS : QUESTIONMARK;
       } break;
 
-      /* Escaped character-classes (\s \S \w \W \d \D \*): */
+      /* Escaped character-classes (\s \S \w \W \d \D \*), the operators
+       * spelled with a backslash (\( \) \| \{), and the subject anchors
+       * (\` \'): */
       case '\\': {
         if (pattern[i + 1] != '\0') {
           /* Skip the escape-char '\\' */
@@ -845,6 +847,20 @@ re_t re_compile_to(const char* pattern,
             } break;
             case '|': {
               re_compiled->type = BRANCH;
+            } break;
+            case '`': {
+              /* Emacs' subject-start anchor.  It is the same node as '^'
+               * because '^' already asserts exactly this here -- the start
+               * of the whole subject, never a line's -- so the spelling is
+               * an alias and not a second semantics.  Without these two
+               * cases the default below turned them into the literal
+               * characters '`' and '\'', which is a pattern quietly
+               * matching the wrong thing rather than one that fails. */
+              re_compiled->type = BEGIN;
+            } break;
+            case '\'': {
+              /* Emacs' subject-end anchor; the same relationship to '$'. */
+              re_compiled->type = END;
             } break;
             case '{': {
               /* An interval, up to the closing "\}".  An unterminated one

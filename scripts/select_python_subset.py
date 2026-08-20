@@ -63,8 +63,13 @@ def rows(path):
 # and that is not enough: Python reads "[[:word:]]" as the set of the
 # characters ":dorw", which happens to agree with the class on "_" and
 # disagrees on every letter, so the row passed the check and then failed
-# against thousands of generated subjects.
-DIALECT = ("\\(", "\\)", "\\|", "\\{", "\\}", "[[:", "{", "}", "\\x")
+# against thousands of generated subjects.  The subject anchors are the
+# same trap: Python reads "abc\\'" as the four characters "abc'", which
+# finds no match in "abcd" for a reason that has nothing to do with the
+# end of the subject, so the row would be selected and then fail on the
+# first generated subject ending in "abc".
+DIALECT = ("\\(", "\\)", "\\|", "\\{", "\\}", "[[:", "{", "}", "\\x",
+	   "\\`", "\\'")
 
 
 def compatible(pattern, text, length, positive):

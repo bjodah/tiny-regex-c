@@ -149,3 +149,22 @@ a\|*b			"*b"		2
 []a]			"a"		1
 []]			"]"		1
 [^]]			"a"		1
+# Emacs' subject anchors.  '\`' and '\'' assert the start and the end of
+# the whole subject, which is exactly what this engine's '^' and '$'
+# already assert, so they compile to the same two nodes.  They used to
+# fall through to the escaped-character default and match a literal '`'
+# or '\''.
+\`abc			"abcd"		3
+abc\'			"xabc"		3
+\`abc\'			"abc"		3
+\`				"`"		0
+\'				"abc"		0
+\`\'				""		0
+\`[ \t]+			"  hi"		2
+[ \t]+\'			"hi  "		2
+\`.*\'			"abc"		3
+\`a\{2\}\'			"aa"		2
+\(\`a\|b\)			"b"		1
+# A quantifier just after one of them has nothing to repeat, so it is the
+# literal character, exactly as after '^'.
+\`*				"*"		1
