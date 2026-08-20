@@ -168,3 +168,23 @@ abc\'			"xabc"		3
 # A quantifier just after one of them has nothing to repeat, so it is the
 # literal character, exactly as after '^'.
 \`*				"*"		1
+# Shy groups: "\(?:...\)" is a group that consumes no capture register.
+# The '?' and ':' used to fall through as literal characters, so these
+# patterns matched the text they are spelled with instead of grouping.
+\(?:a\)				"a"		1
+\(?:abc\)			"xabc"		3
+x\(?:a\|b\)y			"xby"		3
+\(?:a\|b\)c			"bc"		2
+\(?:a\)*			"aaa"		3
+\(?:a\)+			"aaa"		3
+\(?:ab\)?c			"abc"		3
+\(?:a\)\{2\}			"aaa"		2
+\(?::\)				":"		1
+\(?:\)				"a"		0
+# The regexp-opt shape: one grouped atom, leftmost-first inside it, and
+# a suffix that applies to the whole result rather than to one branch.
+\(?:cart\|car\|cat\|c\)s	"cars"		4
+\(?:cart\|car\|cat\|c\)s	"carts"		5
+# A shy group beside a capturing one leaves its number alone.
+\(?:a\)\(b\)			"ab"		2
+\(?:\(a\)\)\(b\)		"ab"		2

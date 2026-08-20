@@ -383,6 +383,143 @@ static int test_execution_state(void) {
  * now RE_STATUS_TOO_COMPLEX. What must not change is the empty-body
  * fallback: a group whose body matches empty can still satisfy a minimum
  * count past the ceiling, and GNU Emacs 31 agrees that it does. */
+/* Shy groups, "\(?:...\)".  Two things are being asserted: that the
+ * spelling is READ -- it used to fall through to the literal characters
+ * '?' and ':', so "\(?:a\)" matched "?:a" and not "a" -- and that a shy
+ * group consumes no capture register, so the numbering of the capturing
+ * groups around it is exactly what it would be without it.  Every
+ * expectation is GNU Emacs 31.0.91's own answer. */
+static int test_shy_groups(void) {
+  static const struct span_case spans[] = {
+      /* the two inputs the engine used to misread */
+      {"\\(?:a\\)", "a", 1, {{0, 1}}, 0},
+      {"\\(?:a\\)", "?:a", 1, {{2, 3}}, 0},
+      /* a shy group is a group: it bounds an alternation and takes a
+       * quantifier, which is what makes it a composable regexp atom */
+      {"x\\(?:a\\|b\\)y", "xby", 1, {{0, 3}}, 0},
+      {"\\(?:a\\|b\\)c", "a", 0, {{0, 0}}, 0},
+      {"\\(?:a\\)*", "aaa", 1, {{0, 3}}, 0},
+      {"\\(?:a\\)+", "aaa", 1, {{0, 3}}, 0},
+      {"\\(?:a\\)\\{2\\}", "aaa", 1, {{0, 2}}, 0},
+      {"\\(?:ab\\)?c", "abc", 1, {{0, 3}}, 0},
+      {"\\(?:a*\\)\\{2\\}", "aa", 1, {{0, 2}}, 0},
+      {"\\(?:\\)", "", 1, {{0, 0}}, 0},
+      {"\\(?::\\)", ":", 1, {{0, 1}}, 0},
+      /* the regexp-opt shape: one grouped atom, leftmost-first inside it,
+       * composed with a suffix that applies to the whole result */
+      {"\\(?:cart\\|car\\|cat\\|c\\)", "cart", 1, {{0, 4}}, 0},
+      {"\\(?:cart\\|car\\|cat\\|c\\)s", "cars", 1, {{0, 4}}, 0},
+      {"\\(?:cart\\|car\\|cat\\|c\\)s", "cats", 1, {{0, 4}}, 0},
+      {"\\(?:cart\\|car\\|cat\\|c\\)s", "cs", 1, {{0, 2}}, 0},
+      {"\\(?:cart\\|car\\|cat\\|c\\)s", "carts", 1, {{0, 5}}, 0},
+      {"x\\(?:a\\|b\\)", "xb", 1, {{0, 2}}, 0},
+      /* capture numbering: mixed, nested, and shy inside an alternation */
+      {"\\(?:a\\)\\(b\\)", "ab", 2, {{0, 2}, {1, 2}}, 0},
+      {"\\(a\\)\\(?:b\\)\\(c\\)", "abc", 3, {{0, 3}, {0, 1}, {2, 3}}, 0},
+      {"\\(?:\\(a\\)\\)\\(b\\)", "ab", 3, {{0, 2}, {0, 1}, {1, 2}}, 0},
+      {"\\(\\(?:a\\)\\(b\\)\\)", "ab", 3, {{0, 2}, {0, 2}, {1, 2}}, 0},
+      {"\\(?:a\\|\\(b\\)\\)c", "bc", 2, {{0, 2}, {0, 1}}, 0},
+      {"\\(?:a\\|\\(b\\)\\)c", "ac", 2, {{0, 2}, {-1, -1}}, 0},
+      {"\\(?:\\(?:\\(a\\)\\)\\)", "a", 2, {{0, 1}, {0, 1}}, 0},
+      /* nothing to repeat at the start of a shy group either */
+      {"\\(?:*\\)", "*", 1, {{0, 1}}, 0},
+  };
+  /* "\(?" is a reserved opening, so every spelling of it but "\(?:" is
+   * refused rather than read as the literal characters -- that fallback
+   * is exactly what made "\(?:a\)" match "?:a".  Emacs rejects the first
+   * three too; it accepts "\(?1:...\)", the explicitly numbered group,
+   * which would have to put a group at a capture number the pattern
+   * names rather than at the one its position gives it. */
+  static const struct compile_case compiles[] = {
+      {"\\(?:a\\)", RE_STATUS_OK},
+      {"\\(?:\\)", RE_STATUS_OK},
+      {"\\(?:\\(?:a\\)\\)", RE_STATUS_OK},
+      {"\\(?\\)", RE_STATUS_BAD_PATTERN},
+      {"\\(?a\\)", RE_STATUS_BAD_PATTERN},
+      {"\\(?", RE_STATUS_BAD_PATTERN},
+      {"\\(?1:a\\)", RE_STATUS_BAD_PATTERN},
+      {"\\(?:a", RE_STATUS_BAD_PATTERN},
+      {"\\(?:", RE_STATUS_BAD_PATTERN},
+      {"a\\(?:b", RE_STATUS_BAD_PATTERN},
+  };
+  int failed = 0;
+  size_t i;
+
+  for (i = 0; i < sizeof(spans) / sizeof(*spans); i++)
+    failed += check_spans(&spans[i]);
+  for (i = 0; i < sizeof(compiles) / sizeof(*compiles); i++)
+    failed += check_compile(&compiles[i]);
+
+  /* The capture ceiling counts capture registers, not groups: nine
+   * capturing groups are the most a re_match_result can report, and any
+   * number of shy ones beside them changes nothing.  The tenth capturing
+   * group is still refused, shy neighbours or not. */
+  {
+    static const struct compile_case cases[] = {
+        {"\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)",
+         RE_STATUS_OK},
+        {"\\(?:a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)"
+         "\\(a\\)",
+         RE_STATUS_OK},
+        {"\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)"
+         "\\(a\\)",
+         RE_STATUS_BAD_PATTERN},
+        {"\\(?:a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)\\(a\\)"
+         "\\(a\\)\\(a\\)",
+         RE_STATUS_BAD_PATTERN},
+    };
+    _Alignas(RE_STORAGE_ALIGNMENT) unsigned char storage[512];
+    unsigned size = sizeof(storage);
+    re_t regex = NULL;
+    re_match_result res;
+
+    for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+      failed += check_compile(&cases[i]);
+
+    /* ... and the shy one really is absent from the answer: nine spans
+     * plus the whole match, with span 1 on the second 'a'. */
+    cases_run++;
+    if (re_compile_checked(cases[1].pattern, RE_FLAG_NONE, storage, &size,
+                           &regex) != RE_STATUS_OK ||
+        re_exec(regex, "aaaaaaaaaa", 0, &res) != RE_STATUS_OK) {
+      fprintf(stderr, "FAIL: shy group beside nine captures did not match\n");
+      failed++;
+    } else if (res.nspans != 10 || res.spans[0].start != 0 ||
+               res.spans[0].end != 10 || res.spans[1].start != 1 ||
+               res.spans[1].end != 2) {
+      fprintf(stderr, "FAIL: shy group beside nine captures: nspans %d, "
+                      "span 0 [%d, %d), span 1 [%d, %d)\n",
+              res.nspans, res.spans[0].start, res.spans[0].end,
+              res.spans[1].start, res.spans[1].end);
+      failed++;
+    }
+  }
+
+  /* Groups still nest only RE_MAX_SPANS deep, shy ones included: the
+   * parse stack is that tall, and shy groups are the first spelling that
+   * can reach it without also asking for a capture register. */
+  {
+    char pattern[128];
+    unsigned depth;
+
+    for (depth = 1; depth <= RE_MAX_SPANS + 1; depth++) {
+      struct compile_case c;
+      unsigned k;
+
+      for (k = 0; k < depth; k++) {
+        memcpy(pattern + k * 4, "\\(?:", 4);
+        memcpy(pattern + depth * 4 + 1 + k * 2, "\\)", 2);
+      }
+      pattern[depth * 4] = 'a';
+      pattern[depth * 6 + 1] = '\0';
+      c.pattern = pattern;
+      c.status = depth <= RE_MAX_SPANS ? RE_STATUS_OK : RE_STATUS_BAD_PATTERN;
+      failed += check_compile(&c);
+    }
+  }
+  return failed;
+}
+
 /* Run one window_case: execute under its limit and compare spans.  The
  * limit is a bound on CONSUMPTION, so the invariant every OK row also
  * carries is that no span ends past it. */
@@ -1380,9 +1517,9 @@ int main(void) {
 
     /* Test 13b: the rest of the acceptance contract -- groups, bracket
      * expressions and quantifiers with nothing (or too much) to repeat.
-     * Emacs agrees with every row but "\(?\)", where its rejection is an
-     * artifact of reserving "\(?" for shy groups, which this engine does
-     * not have. */
+     * Emacs agrees with every row.  "\(?\)" is among them since shy
+     * groups landed: "\(?" is a reserved opening here as it is there, so
+     * the '?' is no longer the literal character it is beside "\(*\)". */
     {
       static const struct compile_case cases[] = {
           /* a group has to be closed, and closed only once */
@@ -1416,7 +1553,7 @@ int main(void) {
           {"^*", RE_STATUS_OK},
           {"$*", RE_STATUS_OK},
           {"\\(*\\)", RE_STATUS_OK},
-          {"\\(?\\)", RE_STATUS_OK},
+          {"\\(?\\)", RE_STATUS_BAD_PATTERN},
           {"\\|*", RE_STATUS_OK},
           {"a\\|*b", RE_STATUS_OK},
           /* too much to repeat: the atom already carries a quantifier */
@@ -1742,6 +1879,7 @@ int main(void) {
   failed += test_execution_state();
   failed += test_group_repeat_ceiling();
   failed += test_match_window();
+  failed += test_shy_groups();
 
   printf("%lu case(s) executed, %d check(s) failed.\n", cases_run, failed);
   return failed ? 1 : 0;

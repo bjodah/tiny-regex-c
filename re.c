@@ -32,6 +32,7 @@
  *   '\{n,m\}'  Match n to m times; see re.h for what makes an interval or a
  *              POSIX class name a bad pattern rather than literal text
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
+ *   '\(?:...\)' Shy group: groups without consuming a capture register
  *
  * TODO:
  *   - \b word boundary support
@@ -159,6 +160,10 @@ typedef struct regex_t {
     };
     struct {
       unsigned char group_size; /*  OR the number of group patterns. */
+      /* The capture register this group fills, or 0 for a shy group
+       * ("\(?:...\)"), which fills none -- group_span() reads 0 as "no
+       * slot", so a shy group is a group everywhere else in the matcher
+       * and a capture nowhere. */
       unsigned char group_num;
     };
     struct {
@@ -733,6 +738,32 @@ struct parse_frame {
   unsigned capture_index; /* its group_num */
 };
 
+/* The opening of a group: "\(", or Emacs' shy spelling "\(?:".  *i is on
+ * the '(' and is left on the last pattern byte the opener spells.  The
+ * answer is the capture number the group records -- 0 for a shy group,
+ * which consumes none, so the numbering of the capturing groups around it
+ * is exactly what it would be if the shy group were not there.  -1 is a
+ * spelling this engine refuses.
+ *
+ * Emacs reserves "\(?" for the shy and the explicitly numbered group, and
+ * only the shy one is honoured here.  "\(?1:...\)" would have to place a
+ * group at a capture number the pattern names rather than at the one its
+ * position gives it, which nothing in this compiler can express, so it is
+ * refused -- as is every other "\(?", which Emacs rejects too.  None of
+ * them falls back to the literal characters it is spelled with: that
+ * fallback is how "\(?:a\)" came to match "?:a". */
+static int group_open(const char* pattern, int* i, int* num_groups) {
+  if (pattern[*i + 1] == '?') {
+    if (pattern[*i + 2] != ':')
+      return -1;
+    *i += 2;
+    return 0;
+  }
+  if (++*num_groups >= RE_MAX_SPANS)
+    return -1;
+  return *num_groups;
+}
+
 /* The "\xXX" escape, *i on the 'x'.  A well-formed one is a single CHAR
  * node holding the byte.  A malformed one is the literal characters it is
  * spelled with -- '\', 'x' and whatever followed -- each its own CHAR node,
@@ -842,15 +873,16 @@ re_t re_compile_to(const char* pattern,
               re_compiled->type = NOT_WHITESPACE;
             } break;
             case '(': {
-              num_groups++;
-              if (num_groups >= RE_MAX_SPANS || depth >= RE_MAX_SPANS)
+              int capture = group_open(pattern, &i, &num_groups);
+
+              if (capture < 0 || depth >= RE_MAX_SPANS)
                 return 0;
               open_groups[depth].group_start = em.nodes;
-              open_groups[depth].capture_index = (unsigned)num_groups;
+              open_groups[depth].capture_index = (unsigned)capture;
               depth++;
               re_compiled->type = GROUP;
               re_compiled->u.group_size = 0;
-              re_compiled->u.group_num = (unsigned char)num_groups;
+              re_compiled->u.group_num = (unsigned char)capture;
             } break;
             case ')': {
               const struct parse_frame* f;

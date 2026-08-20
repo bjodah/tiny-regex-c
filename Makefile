@@ -123,8 +123,11 @@ verify-syntax:
 SCC ?= scc
 SCC_PATHS ?= re.c re.h $(FUZZ_SRCS)
 SCC_COMPLEXITY_PATHS ?= re.c re.h
-SCC_COMPLEXITY_MAX ?= 345
-SCC_FILE_COMPLEXITY_MAX ?= 345
+# The measured actual, with no slack: raising either is an explicit
+# decision, and the rationale and the before/after measurement live in the
+# commit that raises it.
+SCC_COMPLEXITY_MAX ?= 348
+SCC_FILE_COMPLEXITY_MAX ?= 348
 PMCCABE ?= pmccabe
 PMCCABE_PATHS ?= re.c
 PMCCABE_FUNCTION_COMPLEXITY_MAX ?= 60

@@ -61,6 +61,14 @@
  *              All but '[:ascii:]' and '[:nonascii:]' are ASCII-only;
  *              those two ask whether the character is ASCII at all.
  *   '\(...\)'  Group, including a trailing quantifier applied to the group
+ *   '\(?:...\)' Shy group: groups -- bounds an alternation, carries a
+ *              quantifier, nests -- without consuming a capture register,
+ *              so the capturing groups around it are numbered exactly as
+ *              they would be without it.  In '\(?:a\)\(b\)' the 'b'
+ *              group is capture 1.  It is what makes a constructed regexp
+ *              (Emacs' regexp-opt) one atom the caller can prefix and
+ *              suffix; a capturing group would renumber the caller's
+ *              captures instead.
  *
  * What is a bad pattern:
  * ----------------------
@@ -75,14 +83,25 @@
  *     '[]a]' is {']', 'a'} and '[]' and '[^]' are unterminated;
  *   - an unknown POSIX class name, and a malformed or unterminated
  *     interval (see '\{n,m\}' above);
- *   - a '\' at the end of the pattern.
+ *   - a '\' at the end of the pattern;
+ *   - a '\(?' that is not '\(?:'.  Emacs reserves that opening, and so
+ *     does this engine: it is never the literal characters it is spelled
+ *     with, which is the fallback that used to make '\(?:a\)' match
+ *     "?:a".
  *
  * Rejected because this engine has no way to report the answer:
  *
  *   - a tenth capture group.  re_match_result carries RE_MAX_SPANS spans,
  *     which is the whole match plus nine groups, so a tenth '\(' is
  *     refused rather than compiled into a group whose span nothing can
- *     hold.  Emacs has no such limit.
+ *     hold.  Shy groups take no register and are not counted here, but no
+ *     more than RE_MAX_SPANS groups of either kind may be open at once --
+ *     that is how tall the compiler's parse stack is.  Emacs has neither
+ *     limit;
+ *   - an explicitly numbered group, '\(?1:...\)'.  Emacs accepts it;
+ *     placing a group at a capture number the pattern names, rather than
+ *     at the one its position gives it, is not something this compiler
+ *     can express, so it is refused rather than misread.
  *
  * Rejected, where Emacs reads the second quantifier as something this
  * engine does not have:
@@ -100,9 +119,9 @@
  * Accepted as the literal character, as in Emacs: '*', '+', '?' and '\{'
  * where there is nothing to repeat -- the start of the pattern, of a group
  * or of an alternative, and just after an anchor.  So '*' matches "*",
- * '^*' matches "*", and '\(*\)' captures it.  (Emacs rejects '\(?'
- * because it reserves that spelling for shy groups, which this engine does
- * not have; here it is the literal '?' like any other.)
+ * '^*' matches "*", and '\(*\)' captures it.  A '?' in that position is
+ * ordinary too ('\(?:*\)' matches "*"), but only inside the group: at
+ * '\(' itself the '?' is the reserved opening above, not a literal.
  *
  * Characters, not bytes:
  * ----------------------

@@ -6,7 +6,7 @@
 # differently would test the wrong language. Every row of tests/nok.lst
 # is executed by tests/test1.c regardless.
 #
-# 24 of 55 rows.
+# 24 of 60 rows.
 \S	"\t \n"	0
 [\S]	"\t \n"	0
 \D	"5"	0

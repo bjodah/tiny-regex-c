@@ -103,6 +103,7 @@ The following features / regex-operators are supported by this library.
   -  `\{,m\}`   Match m or less times
   -  `\{n,m\}`  Match n to m times
   -  `\(...\)`  Group
+  -  `\(?:...\)` Shy group: groups without consuming a capture register
 
 Bare `(`, `)`, `|`, `{`, and `}` are literal characters; grouping,
 alternation, and intervals use the escaped Emacs-style forms above.
@@ -148,12 +149,24 @@ accepted language is an exact subset. Rejected, all as in Emacs:
   `n`, `n,`, `,m` or `n,m` (counts up to 65535, `m` not below `n`) or
   whose `\{` is never closed. None of these falls back to matching the
   literal characters it is spelled with;
-- a `\` at the end of the pattern.
+- a `\` at the end of the pattern;
+- a `\(?` that is not `\(?:`. That opening is reserved here as it is in
+  Emacs, and is never the literal characters it is spelled with -- the
+  fallback that used to make `\(?:a\)` match `"?:a"`.
 
 Rejected because there is nowhere to report the answer: a tenth capture
 group. `re_match_result` carries `RE_MAX_SPANS` spans, the whole match
 plus nine groups, so a tenth `\(` is refused rather than compiled into a
-group whose span nothing can hold. Emacs has no such limit.
+group whose span nothing can hold. Shy groups take no register and are not
+counted, but no more than `RE_MAX_SPANS` groups of either kind may be open
+at once, that being the height of the compiler's parse stack. Emacs has
+neither limit.
+
+Rejected because this library cannot express it: the explicitly numbered
+group `\(?1:...\)`, which Emacs accepts. Placing a group at a capture
+number the pattern names rather than at the one its position gives it is
+not something this compiler can do, so the spelling is refused rather than
+misread.
 
 Rejected where Emacs reads the second quantifier as something this
 library does not have: a quantifier on an atom that already carries one.
@@ -168,9 +181,23 @@ compile a node the matcher could only ever fail on. A quantifier on a
 Where there is nothing to repeat -- the start of the pattern, of a group
 or of an alternative, and just after an anchor -- `*`, `+`, `?` and `\{`
 are the literal characters, as in Emacs: `*` matches `*`, `^*` matches
-`*`, and `\(*\)` captures it. (Emacs rejects `\(?`, reserving that
-spelling for shy groups, which this library does not have; here it is an
-ordinary literal `?`.)
+`*`, and `\(*\)` captures it. A `?` in that position is ordinary too --
+`\(?:*\)` matches `*` -- but only inside the group: at `\(` itself the
+`?` is the reserved opening above, not a literal.
+
+### Shy groups
+`\(?:...\)` is a group in every way the matcher cares about -- it bounds
+an alternation, it takes a quantifier, it nests -- except that it consumes
+no capture register. The capturing groups around it are numbered exactly
+as they would be without it, so in `\(?:a\)\(b\)` the `b` group is
+capture 1, and in `\(?:a\|\(b\)\)c` it is capture 1 as well.
+
+That is what makes a *constructed* regexp composable. A generator such as
+Emacs' `regexp-opt` has to return one atom the caller can prefix and
+suffix: `\(?:cart\|car\|cat\|c\)s` matches `"cars"` whole, where the
+bare alternation `cart\|car\|cat\|c` followed by `s` would apply the
+`s` to the last branch alone. A capturing group is not a substitute --
+it renumbers the caller's own captures.
 
 `^` matches at the start of the subject handed to `re_exec()`, not at its
 `start_offset`: that argument says where to resume scanning, so a
