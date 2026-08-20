@@ -42,7 +42,7 @@ run_clang_tidy() {
 export -f run_clang_check run_clang_tidy
 export CC="ccache clang"
 
-make compile-db
+"${MAKE_PARALLEL[@]}" compile-db
 export COMPILE_DB=$(/bin/pwd)
 
 compile_db_files | "${PARALLEL}" --halt soon,fail=1 --jobs "${JOBS}" --line-buffer run_clang_check
