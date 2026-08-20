@@ -45,7 +45,7 @@ export CC="ccache clang"
 "${MAKE_PARALLEL[@]}" compile-db
 export COMPILE_DB=$(/bin/pwd)
 
-compile_db_files | "${PARALLEL}" --halt soon,fail=1 --jobs "${JOBS}" --line-buffer run_clang_check
+compile_db_files | "${GNU_PARALLEL}" --halt soon,fail=1 --jobs "${JOBS}" --line-buffer run_clang_check
 
 # CPROVER guards the CBMC-only formal-verification harness at the bottom of
 # re.c; cppcheck otherwise analyzes both configurations of that #ifdef and
@@ -55,4 +55,4 @@ cppcheck --quiet --error-exitcode=1 --std=c23 \
 	--inline-suppr --suppress=preprocessorErrorDirective:auto.h -UCPROVER \
 	-j "${JOBS}" ./re.c ./fuzz/*.c
 
-compile_db_files | "${PARALLEL}" --halt soon,fail=1 --jobs "${JOBS}" --line-buffer run_clang_tidy
+compile_db_files | "${GNU_PARALLEL}" --halt soon,fail=1 --jobs "${JOBS}" --line-buffer run_clang_tidy

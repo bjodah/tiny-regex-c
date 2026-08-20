@@ -13,6 +13,9 @@ enum { MaxFieldSize = 4096 };
  *
  * Input format: the first byte selects the small buffer's size, 1..64; the
  * rest splits at the first '\n' into pattern and subject text. */
+/* libFuzzer resolves this entry point by name at link time, so it cannot
+ * have internal linkage, and no header declares it either.
+ * NOLINTNEXTLINE(misc-use-internal-linkage) */
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (size < 1 || size > MaxFieldSize)
     return 0;
