@@ -69,13 +69,29 @@ test-pynok: tests/test_rand_neg tests/pynok.lst
 pysubset:
 	@$(PYTHON) ./scripts/select_python_subset.py
 
-test: all verify-syntax
+# Every leaf here is a *run* of one already-built binary (or one of the two
+# Python drivers), and they are prerequisites rather than recipe lines
+# because a recipe's lines are a sequence make may not overlap: `make -j`
+# runs prerequisites concurrently and recipe lines one after another.  The
+# two Python drivers were $(MAKE) recursions for the same reason and are
+# ordinary prerequisites now, so the jobserver schedules them beside the
+# rest instead of after it.
+test: all verify-syntax test-pyok test-pynok run-test1 run-test-compile \
+	run-test2 run-test-api run-test-end-anchor
+
+run-test1: tests/test1
 	$(TEST_RUNNER) ./tests/test1
-	$(MAKE) test-pyok
-	$(MAKE) test-pynok
+
+run-test-compile: tests/test_compile
 	$(TEST_RUNNER) ./tests/test_compile
+
+run-test2: tests/test2
 	$(TEST_RUNNER) ./tests/test2
+
+run-test-api: tests/test_api
 	$(TEST_RUNNER) ./tests/test_api
+
+run-test-end-anchor: tests/test_end_anchor
 	$(TEST_RUNNER) ./tests/test_end_anchor
 
 check: test
@@ -246,6 +262,8 @@ fuzz-smoke: $(FUZZ_BIN)
 fuzz-clean:
 	rm -rf $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR) $(FUZZ_BIN)
 
-.PHONY: all clean test-pyok test-pynok pysubset test check verify verify-syntax complexity \
+.PHONY: all clean test-pyok test-pynok pysubset test check verify verify-syntax \
+	run-test1 run-test-compile run-test2 run-test-api run-test-end-anchor \
+	complexity \
 	complexity-check pmccabe pmccabe-check coverage coverage-clean \
 	format format-check compile-db iwyu fuzz fuzz-smoke fuzz-clean
