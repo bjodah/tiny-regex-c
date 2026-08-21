@@ -126,8 +126,8 @@ SCC_COMPLEXITY_PATHS ?= re.c re.h
 # The measured actual, with no slack: raising either is an explicit
 # decision, and the rationale and the before/after measurement live in the
 # commit that raises it.
-SCC_COMPLEXITY_MAX ?= 348
-SCC_FILE_COMPLEXITY_MAX ?= 348
+SCC_COMPLEXITY_MAX ?= 360
+SCC_FILE_COMPLEXITY_MAX ?= 360
 PMCCABE ?= pmccabe
 PMCCABE_PATHS ?= re.c
 PMCCABE_FUNCTION_COMPLEXITY_MAX ?= 60

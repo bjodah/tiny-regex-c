@@ -820,10 +820,24 @@ re_t re_compile_to(const char* pattern,
     switch (c) {
       /* Meta-characters: */
       case '^': {
-        re_compiled->type = BEGIN;
+        if (em.nodes == 0 ||
+            emitter_node_at(&em, em.nodes - 1)->type == GROUP ||
+            emitter_node_at(&em, em.nodes - 1)->type == BRANCH)
+          re_compiled->type = BEGIN;
+        else {
+          re_compiled->type = CHAR;
+          set_char_cp(re_compiled, '^');
+        }
       } break;
       case '$': {
-        re_compiled->type = END;
+        if (i + 1 == plen ||
+            (pattern[i + 1] == '\\' &&
+             (pattern[i + 2] == '|' || pattern[i + 2] == ')')))
+          re_compiled->type = END;
+        else {
+          re_compiled->type = CHAR;
+          set_char_cp(re_compiled, '$');
+        }
       } break;
       case '.': {
         re_compiled->type = DOT;

@@ -612,7 +612,9 @@ static int backward_scan(re_t regex, const char* text, int limit,
  * stops, and one that would hold '\'' at the limit if the limit were a
  * truncation.  Emacs' answers are in the table above the rows. */
 static int test_match_window(void) {
-  static const struct window_case cases[] = {
+      static const struct window_case cases[] = {
+          {"^a$", "a", 0, 1, 1, {{0, 1}},},
+          {"a$b", "a$b", 0, 3, 1, {{0, 3}},},
       /* The canonical case: the preferred alternative reaches its 'b'
        * outside the limit, so it loses to the later 'x' inside it.  The
        * unlimited control below it is the same pattern's other answer. */
@@ -1316,6 +1318,33 @@ int main(void) {
         failed += check_spans(&cases[i]);
     }
 
+    /* Test 12a: '^' and '$' are anchors only in their contextual positions.
+     * These spans are GNU Emacs' answers, including the literal and nested
+     * cases that distinguish this rule from treating every spelling as an
+     * anchor. */
+    {
+      static const struct span_case cases[] = {
+          {"a$b", "a$b", 1, {{0, 3}}, 0},
+          {"a$b", "ab", 0, {{0, 0}}, 0},
+          {"a$*", "a$$", 1, {{0, 3}}, 0},
+          {"$", "", 1, {{0, 0}}, 0},
+          {"\\(a$\\)", "a", 2, {{0, 1}, {0, 1}}, 0},
+          {"\\(?:a$\\)", "a", 1, {{0, 1}}, 0},
+          {"\\(\\(a$\\)\\)", "a", 3, {{0, 1}, {0, 1}, {0, 1}}, 0},
+          {"^a", "a", 1, {{0, 1}}, 0},
+          {"a^b", "a^b", 1, {{0, 3}}, 0},
+          {"a^b", "ab", 0, {{0, 0}}, 0},
+          {"\\(b^a\\)", "b^a", 2, {{0, 3}, {0, 3}}, 0},
+          {"z\\|^a", "a", 1, {{0, 1}}, 0},
+          {"\\(?:^a\\)", "a", 1, {{0, 1}}, 0},
+          {"\\(^a\\)*", "a", 2, {{0, 1}, {0, 1}}, 0},
+          {"^a$", "a", 1, {{0, 1}}, 0},
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+        failed += check_spans(&cases[i]);
+    }
+
     /* Test 12: intervals, POSIX class names, '^' anchoring and greedy
      * '?'.  Spans are GNU Emacs' again. */
     {
@@ -1527,6 +1556,8 @@ int main(void) {
           {"\\(\\(a\\)\\)", RE_STATUS_OK},
           {"\\(", RE_STATUS_BAD_PATTERN},
           {"\\(a", RE_STATUS_BAD_PATTERN},
+          {"\\(a$", RE_STATUS_BAD_PATTERN},
+          {"\\(^a", RE_STATUS_BAD_PATTERN},
           {"\\(\\(a\\)", RE_STATUS_BAD_PATTERN},
           {"\\(a\\|b", RE_STATUS_BAD_PATTERN},
           {"a\\)", RE_STATUS_BAD_PATTERN},
