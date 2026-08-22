@@ -830,9 +830,8 @@ re_t re_compile_to(const char* pattern,
         }
       } break;
       case '$': {
-        if (i + 1 == plen ||
-            (pattern[i + 1] == '\\' &&
-             (pattern[i + 2] == '|' || pattern[i + 2] == ')')))
+        if (i + 1 == plen || (pattern[i + 1] == '\\' &&
+                              (pattern[i + 2] == '|' || pattern[i + 2] == ')')))
           re_compiled->type = END;
         else {
           re_compiled->type = CHAR;
